@@ -23,6 +23,7 @@ __all__ = [
     "Signature",
     "StepContext",
     "Task",
+    "UnboundAppError",
     "UnknownTaskError",
     "UnsupportedDriverError",
     "Workflow",
@@ -43,6 +44,10 @@ class UnknownTaskError(LookupError):
     """No task is registered under the requested name."""
 
 
+class UnboundAppError(RuntimeError):
+    """`submit` was used on an app with no pool attached."""
+
+
 class NoRetryError(Exception):
     """Raise to fail a job permanently regardless of its retry policy."""
 
@@ -54,10 +59,19 @@ class Task:
     usable as an ordinary function in tests and from other tasks.
     """
 
-    __slots__ = ("durable", "fn", "name", "no_retry_on", "retry_on", "store_result")
+    __slots__ = (
+        "_app",
+        "durable",
+        "fn",
+        "name",
+        "no_retry_on",
+        "retry_on",
+        "store_result",
+    )
 
     def __init__(
         self,
+        app: Gylo,
         name: str,
         fn: Callable[..., Any],
         retry_on: tuple[type[BaseException], ...] = (Exception,),
@@ -65,6 +79,7 @@ class Task:
         store_result: bool = False,
         durable: bool = False,
     ) -> None:
+        self._app = app
         self.name = name
         self.fn = fn
         self.retry_on = retry_on
@@ -141,6 +156,15 @@ class Task:
         transaction and commits atomically with whatever else it is doing.
         """
         return await self.options().enqueue(conn, *args, **kwargs)
+
+    async def submit(self, *args: Any, **kwargs: Any) -> int:
+        """Enqueue on a connection borrowed from the app's pool.
+
+        Convenient where no connection is at hand, and a weaker promise: the
+        job is committed on its own, so it can survive a transaction of yours
+        that later rolls back.
+        """
+        return await self.options().submit(*args, **kwargs)
 
     async def enqueue_many(
         self,
@@ -243,6 +267,11 @@ class BoundTask:
             durable=self.task.durable,
         )
 
+    async def submit(self, *args: Any, **kwargs: Any) -> int:
+        """Enqueue on a connection borrowed from the app's pool."""
+        async with self.task._app.borrow() as conn:
+            return await self.enqueue(conn, *args, **kwargs)
+
     async def enqueue(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
         """Insert the job, returning its id.
 
@@ -276,11 +305,28 @@ class BoundTask:
 class Gylo:
     """Registry of the tasks a worker can run."""
 
-    __slots__ = ("_crons", "_tasks")
+    __slots__ = ("_crons", "_pool", "_tasks")
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
         self._crons: dict[str, CronEntry] = {}
+        self._pool: Any = None
+
+    def bind(self, pool: Any) -> None:
+        """Attach a connection pool for `submit`.
+
+        Only needed by callers that do not have a connection to hand. Anything
+        that should commit with your own write wants `enqueue(conn, ...)`.
+        """
+        self._pool = pool
+
+    def borrow(self) -> Any:
+        if self._pool is None:
+            raise UnboundAppError(
+                "call bind(pool) before submit, or use enqueue(conn, ...) to "
+                "place the job in a transaction you control"
+            )
+        return self._pool.acquire()
 
     def task(
         self,
@@ -307,7 +353,9 @@ class Gylo:
             task_name = name or f"{func.__module__}.{func.__qualname__}"
             if task_name in self._tasks:
                 raise ValueError(f"task {task_name!r} is already registered")
-            task = Task(task_name, func, retry_on, no_retry_on, store_result, durable)
+            task = Task(
+                self, task_name, func, retry_on, no_retry_on, store_result, durable
+            )
             self._tasks[task_name] = task
             return task
 

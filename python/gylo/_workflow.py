@@ -1,9 +1,9 @@
 """Workflows as a single directed graph.
 
-Celery ships six canvas types with rules about how they compose. There is one
-primitive here — a graph of jobs and the edges between them — and `chain`,
-`group`, and `chord` are constructors over it. Anything they can express, a
-graph can, and there is only one thing to make correct.
+There is one primitive — a graph of jobs and the edges between them — and
+`chain`, `group`, and `chord` are constructors over it rather than separate
+kinds of thing. Anything they can express, a graph can, so there is only one
+composition to make correct.
 
 A job with unmet dependencies is inserted as `available` with `scheduled_at`
 at infinity, so it is invisible to the ordinary fetch without needing a state
@@ -145,9 +145,8 @@ def group(*branches: Signature | Workflow) -> Workflow:
 def chord(body: Signature | Workflow, callback: Signature) -> Workflow:
     """Run `callback` once everything in `body` has finished.
 
-    Fan-in is the part Celery gets wrong on Redis, and it is free here: the
-    callback simply counts more than one dependency, and the parent that
-    happens to finish last releases it.
+    Fan-in needs no special handling: the callback counts more than one
+    dependency, and whichever parent finishes last releases it.
     """
     flow = _as_workflow(body)
     tails = flow.leaves
