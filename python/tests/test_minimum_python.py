@@ -33,3 +33,14 @@ def test_parses_on_the_minimum_supported_python(source: Path) -> None:
             f"{source.name} needs syntax newer than "
             f"{MINIMUM[0]}.{MINIMUM[1]}: {error.msg}"
         )
+
+
+def test_the_typing_marker_ships() -> None:
+    import gylo
+
+    marker = Path(gylo.__file__).parent / "py.typed"
+
+    assert marker.is_file(), (
+        f"{marker} is missing, so `Typing :: Typed` in pyproject.toml is a "
+        f"promise the distribution does not keep"
+    )
