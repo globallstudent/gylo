@@ -26,8 +26,10 @@ jobs:
         platform:
           - { runner: ubuntu-22.04, target: x86_64, manylinux: auto }
           - { runner: ubuntu-22.04, target: aarch64, manylinux: auto }
-          - { runner: ubuntu-22.04, target: x86_64, manylinux: musllinux_1_2 }
-          - { runner: ubuntu-22.04, target: aarch64, manylinux: musllinux_1_2 }
+          # full triples: given the short name the musl containers resolve the
+          # gnu target and ring's C build fails against the wrong libc
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { runner: ubuntu-22.04, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2 }
           - { runner: macos-14, target: aarch64, manylinux: auto }
           - { runner: macos-14, target: x86_64, manylinux: auto }
 
