@@ -41,6 +41,8 @@ pub enum Error {
     HandshakeTimeout(Duration),
     #[error("python child exited: {0}")]
     ChildExited(String),
+    #[error("invalid configuration: {0}")]
+    Config(String),
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,32 @@ impl Default for Config {
             app: String::new(),
             python_path: None,
         }
+    }
+}
+
+impl Config {
+    /// Rejects settings whose effect would be silent rather than obvious. A
+    /// maintenance interval at or above the lease is the dangerous one: leases
+    /// expire before they are renewed, so healthy jobs are reclaimed and run a
+    /// second time while everything appears to be working.
+    fn validate(&self) -> Result<(), Error> {
+        let invalid = if self.app.is_empty() {
+            Some("app must be set to a module:attribute path".to_owned())
+        } else if self.concurrency == 0 {
+            Some("concurrency must be at least 1".to_owned())
+        } else if self.batch < 1 {
+            Some(format!("batch must be at least 1, got {}", self.batch))
+        } else if self.maintenance_interval >= self.lease {
+            Some(format!(
+                "maintenance interval {:?} must be shorter than the lease {:?}, \
+                 or running jobs will be reclaimed and run twice",
+                self.maintenance_interval, self.lease
+            ))
+        } else {
+            None
+        };
+
+        invalid.map_or(Ok(()), |reason| Err(Error::Config(reason)))
     }
 }
 
@@ -191,6 +219,9 @@ impl InFlight {
 /// around a fresh child and whatever it held is handed back for another
 /// attempt. Surviving that is the reason task code runs in its own process.
 pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> Result<(), Error> {
+    config.validate()?;
+
+    let worker = Uuid::new_v4();
     let inflight = Arc::new(InFlight::new(config.concurrency));
     let wakeup = Arc::new(Notify::new());
 
@@ -203,6 +234,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
     let maintaining = tokio::spawn(maintain(
         pool.clone(),
         config.clone(),
+        worker,
         Arc::clone(&inflight),
         shutdown.clone(),
     ));
@@ -212,14 +244,14 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
 
     while !shutdown.is_cancelled() {
         let started = tokio::time::Instant::now();
-        match session(&pool, &config, &inflight, &wakeup, &shutdown).await {
+        match session(&pool, &config, worker, &inflight, &wakeup, &shutdown).await {
             Ok(()) => break,
             Err(error) => {
                 if started.elapsed() >= HEALTHY_SESSION {
                     consecutive = 0;
                 }
                 consecutive += 1;
-                hand_back(&pool, &inflight, &config).await;
+                hand_back(&pool, &inflight, &config, worker).await;
 
                 if consecutive > config.max_restarts {
                     tracing::error!(
@@ -250,12 +282,12 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
 
 /// Releases whatever the dead session was holding so another attempt can start
 /// now rather than after the lease runs out.
-async fn hand_back(pool: &PgPool, inflight: &InFlight, config: &Config) {
+async fn hand_back(pool: &PgPool, inflight: &InFlight, config: &Config, worker: Uuid) {
     let held = inflight.take();
     if held.is_empty() {
         return;
     }
-    if let Err(error) = gylo_pg::abandon_leases(pool, &held).await {
+    if let Err(error) = gylo_pg::abandon_leases(pool, &held, worker).await {
         tracing::error!(%error, jobs = held.len(), "could not release abandoned jobs");
         return;
     }
@@ -273,6 +305,7 @@ async fn hand_back(pool: &PgPool, inflight: &InFlight, config: &Config) {
 async fn session(
     pool: &PgPool,
     config: &Config,
+    worker: Uuid,
     inflight: &Arc<InFlight>,
     wakeup: &Notify,
     shutdown: &CancellationToken,
@@ -300,10 +333,11 @@ async fn session(
         pool.clone(),
         Arc::clone(inflight),
         config.clone(),
+        worker,
     ));
 
     let outcome = tokio::select! {
-        result = dispatch(writer, pool.clone(), config, inflight, wakeup, shutdown) => result,
+        result = dispatch(writer, pool.clone(), config, worker, inflight, wakeup, shutdown) => result,
         status = child.wait() => Err(Error::ChildExited(match status {
             Ok(status) => status.to_string(),
             Err(error) => error.to_string(),
@@ -373,6 +407,7 @@ async fn listen(pool: PgPool, queue: String, wakeup: Arc<Notify>, shutdown: Canc
 async fn maintain(
     pool: PgPool,
     config: Config,
+    worker: Uuid,
     inflight: Arc<InFlight>,
     shutdown: CancellationToken,
 ) {
@@ -383,7 +418,7 @@ async fn maintain(
         }
 
         let held = inflight.snapshot();
-        if let Err(error) = gylo_pg::renew_leases(&pool, &held, config.lease).await {
+        if let Err(error) = gylo_pg::renew_leases(&pool, &held, worker, config.lease).await {
             tracing::error!(%error, jobs = held.len(), "renewing leases failed");
         }
 
@@ -405,11 +440,11 @@ async fn dispatch(
     mut writer: OwnedWriteHalf,
     pool: PgPool,
     config: &Config,
+    worker: Uuid,
     inflight: &InFlight,
     wakeup: &Notify,
     shutdown: &CancellationToken,
 ) -> Result<(), Error> {
-    let worker = Uuid::new_v4();
     let mut buf = Vec::with_capacity(READ_BUFFER);
     let mut reserved = Vec::with_capacity(config.batch as usize);
 
@@ -458,7 +493,9 @@ async fn dispatch(
                 Ok(()) => reserved.push(id),
                 Err(error) => {
                     tracing::error!(job = id, %error, "job could not be encoded, discarding");
-                    if let Err(error) = gylo_pg::discard(&pool, id, &error.to_string()).await {
+                    if let Err(error) =
+                        gylo_pg::discard(&pool, id, worker, &error.to_string()).await
+                    {
                         tracing::error!(job = id, %error, "discarding the job failed");
                     }
                 }
@@ -505,17 +542,18 @@ impl Pending {
         self.completed.len() + self.retry.len() + self.terminal.len()
     }
 
-    async fn flush(&mut self, pool: &PgPool, inflight: &InFlight, config: &Config) {
+    async fn flush(&mut self, pool: &PgPool, inflight: &InFlight, config: &Config, worker: Uuid) {
         if self.len() == 0 {
             return;
         }
-        if let Err(error) = gylo_pg::complete_many(pool, &self.completed).await {
+        if let Err(error) = gylo_pg::complete_many(pool, &self.completed, worker).await {
             tracing::error!(%error, jobs = self.completed.len(), "recording completions failed");
         }
         if let Err(error) = gylo_pg::retry_many(
             pool,
             &self.retry,
             &self.retry_errors,
+            worker,
             config.retry_base,
             config.retry_cap,
         )
@@ -523,7 +561,8 @@ impl Pending {
         {
             tracing::error!(%error, jobs = self.retry.len(), "scheduling retries failed");
         }
-        if let Err(error) = gylo_pg::discard_many(pool, &self.terminal, &self.terminal_errors).await
+        if let Err(error) =
+            gylo_pg::discard_many(pool, &self.terminal, &self.terminal_errors, worker).await
         {
             tracing::error!(%error, jobs = self.terminal.len(), "recording failures failed");
         }
@@ -548,6 +587,7 @@ async fn collect_completions(
     pool: PgPool,
     inflight: Arc<InFlight>,
     config: Config,
+    worker: Uuid,
 ) {
     let batch = config.completion_batch;
     let linger = config.completion_linger;
@@ -589,25 +629,25 @@ async fn collect_completions(
                         }
                         Err(error) => {
                             tracing::error!(%error, "python child sent an unreadable frame");
-                            pending.flush(&pool, &inflight, &config).await;
+                            pending.flush(&pool, &inflight, &config, worker).await;
                             return;
                         }
                     }
                 }
 
                 if pending.len() >= batch {
-                    pending.flush(&pool, &inflight, &config).await;
+                    pending.flush(&pool, &inflight, &config, worker).await;
                     deadline = None;
                 }
             }
             () = timer => {
-                pending.flush(&pool, &inflight, &config).await;
+                pending.flush(&pool, &inflight, &config, worker).await;
                 deadline = None;
             }
         }
     }
 
-    pending.flush(&pool, &inflight, &config).await;
+    pending.flush(&pool, &inflight, &config, worker).await;
 }
 
 fn spawn_child(config: &Config, socket: &Path) -> std::io::Result<Child> {

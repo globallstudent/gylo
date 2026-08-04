@@ -28,6 +28,8 @@ _LENGTH = struct.Struct("<I")
 _COMPLETE = struct.Struct("<IBqB")
 _DISPATCH_HEAD = struct.Struct("<qH")
 _COMPLETE_BODY_BYTES = 10
+_DISPATCH_HEAD_BYTES = 11
+MAX_ERROR_BYTES = 64 * 1024
 
 
 class ProtocolError(Exception):
@@ -46,7 +48,12 @@ def encode_success(job_id: int) -> bytes:
 
 
 def encode_failure(job_id: int, error: str, *, retry: bool) -> bytes:
+    """Frame a failure, trimming the rendered error to a size the supervisor
+    will accept. An oversized frame would be rejected on the far side, killing
+    the session and redelivering the job to fail exactly the same way."""
     rendered = error.encode("utf-8", "replace")
+    if len(rendered) > MAX_ERROR_BYTES:
+        rendered = rendered[:MAX_ERROR_BYTES] + b"\n... truncated"
     return (
         _COMPLETE.pack(
             _COMPLETE_BODY_BYTES + len(rendered),
@@ -84,6 +91,9 @@ class Decoder:
                 )
             if size - pos - HEADER_BYTES < body_len:
                 break
+
+            if body_len < _DISPATCH_HEAD_BYTES:
+                raise ProtocolError("frame body is truncated")
 
             body = pos + HEADER_BYTES
             kind = buf[body]

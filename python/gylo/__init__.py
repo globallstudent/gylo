@@ -41,7 +41,7 @@ class Task:
     usable as an ordinary function in tests and from other tasks.
     """
 
-    __slots__ = ("fn", "name", "no_retry_on", "options_default", "retry_on")
+    __slots__ = ("fn", "name", "no_retry_on", "retry_on")
 
     def __init__(
         self,
@@ -54,7 +54,6 @@ class Task:
         self.fn = fn
         self.retry_on = retry_on
         self.no_retry_on = no_retry_on
-        self.options_default = Options()
 
     def should_retry(self, error: BaseException) -> bool:
         """Whether `error` earns another attempt.
@@ -88,20 +87,14 @@ class Task:
         the task's own parameters — a task is free to take an argument called
         `queue` or `priority`.
         """
+        given = {
+            "queue": queue,
+            "priority": priority,
+            "delay": delay,
+            "max_attempts": max_attempts,
+        }
         return BoundTask(
-            self,
-            Options(
-                queue=self.options_default.queue if queue is None else queue,
-                priority=(
-                    self.options_default.priority if priority is None else priority
-                ),
-                delay=self.options_default.delay if delay is None else delay,
-                max_attempts=(
-                    self.options_default.max_attempts
-                    if max_attempts is None
-                    else max_attempts
-                ),
-            ),
+            self, Options(**{k: v for k, v in given.items() if v is not None})
         )
 
     async def enqueue(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
@@ -110,9 +103,7 @@ class Task:
         The connection is explicit so the insert lands in the caller's own
         transaction and commits atomically with whatever else it is doing.
         """
-        return await BoundTask(self, self.options_default).enqueue(
-            conn, *args, **kwargs
-        )
+        return await self.options().enqueue(conn, *args, **kwargs)
 
     async def enqueue_many(
         self,
@@ -120,8 +111,7 @@ class Task:
         /,
         calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
     ) -> None:
-        """Insert many jobs in one round trip."""
-        return await BoundTask(self, self.options_default).enqueue_many(conn, calls)
+        return await self.options().enqueue_many(conn, calls)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +150,11 @@ class BoundTask:
         /,
         calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
     ) -> None:
-        """Ids are not returned: reporting them per row would cost the
-        pipelining that makes this worth using over a loop of `enqueue`."""
+        """Insert many jobs in one round trip.
+
+        Ids are not returned, because reporting them per row would cost the
+        pipelining that makes this worth using over a loop of `enqueue`.
+        """
         if not calls:
             return
         rows = [self._row(call_args, call_kwargs) for call_args, call_kwargs in calls]

@@ -82,8 +82,27 @@ pub fn encode(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolError>
     }
 }
 
+const DISPATCH_HEAD_BYTES: usize = 1 + 8 + 2;
+const COMPLETE_HEAD_BYTES: usize = 1 + 8 + 1;
+
 fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<(), ProtocolError> {
-    out.extend_from_slice(&[0; HEADER_BYTES]);
+    let body_len = match message {
+        Message::Dispatch { task, payload, .. } => {
+            u16::try_from(task.len()).map_err(|_| ProtocolError::TaskNameTooLong(task.len()))?;
+            DISPATCH_HEAD_BYTES + task.len() + payload.len()
+        }
+        Message::Complete { outcome, .. } => match outcome {
+            Outcome::Success => COMPLETE_HEAD_BYTES,
+            Outcome::Failure { error, .. } => COMPLETE_HEAD_BYTES + error.len(),
+        },
+    };
+    if body_len > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge(body_len));
+    }
+    let header = u32::try_from(body_len).map_err(|_| ProtocolError::FrameTooLarge(body_len))?;
+
+    out.reserve(HEADER_BYTES + body_len);
+    out.extend_from_slice(&header.to_le_bytes());
 
     match message {
         Message::Dispatch { id, task, payload } => {
@@ -112,12 +131,7 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
         }
     }
 
-    let body_len = out.len() - start - HEADER_BYTES;
-    if body_len > MAX_FRAME_BYTES {
-        return Err(ProtocolError::FrameTooLarge(body_len));
-    }
-    let header = u32::try_from(body_len).map_err(|_| ProtocolError::FrameTooLarge(body_len))?;
-    out[start..start + HEADER_BYTES].copy_from_slice(&header.to_le_bytes());
+    debug_assert_eq!(out.len() - start - HEADER_BYTES, body_len);
     Ok(())
 }
 
@@ -137,7 +151,7 @@ impl Decoder {
         self.buf.extend_from_slice(bytes);
     }
 
-    pub fn buffered(&self) -> usize {
+    fn buffered(&self) -> usize {
         self.buf.len() - self.pos
     }
 

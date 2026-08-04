@@ -20,11 +20,13 @@ class UnsupportedDriverError(TypeError):
 
 
 class Adapter(Protocol):
-    @staticmethod
-    async def insert(conn: Any, params: tuple[Any, ...]) -> int: ...
+    INSERT: str
 
-    @staticmethod
-    async def insert_many(conn: Any, rows: list[tuple[Any, ...]]) -> None: ...
+    @classmethod
+    async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int: ...
+
+    @classmethod
+    async def insert_many(cls, conn: Any, rows: list[tuple[Any, ...]]) -> None: ...
 
 
 class AsyncpgAdapter:
@@ -34,13 +36,13 @@ class AsyncpgAdapter:
         "RETURNING id"
     )
 
-    @staticmethod
-    async def insert(conn: Any, params: tuple[Any, ...]) -> int:
-        return await conn.fetchval(AsyncpgAdapter.INSERT, *params)
+    @classmethod
+    async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int:
+        return await conn.fetchval(cls.INSERT, *params)
 
-    @staticmethod
-    async def insert_many(conn: Any, rows: list[tuple[Any, ...]]) -> None:
-        await conn.executemany(AsyncpgAdapter.INSERT, rows)
+    @classmethod
+    async def insert_many(cls, conn: Any, rows: list[tuple[Any, ...]]) -> None:
+        await conn.executemany(cls.INSERT, rows)
 
 
 class PsycopgAdapter:
@@ -50,17 +52,17 @@ class PsycopgAdapter:
         "RETURNING id"
     )
 
-    @staticmethod
-    async def insert(conn: Any, params: tuple[Any, ...]) -> int:
+    @classmethod
+    async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int:
         async with conn.cursor() as cursor:
-            await cursor.execute(PsycopgAdapter.INSERT, params)
+            await cursor.execute(cls.INSERT, params)
             row = await cursor.fetchone()
         return row[0]
 
-    @staticmethod
-    async def insert_many(conn: Any, rows: list[tuple[Any, ...]]) -> None:
+    @classmethod
+    async def insert_many(cls, conn: Any, rows: list[tuple[Any, ...]]) -> None:
         async with conn.cursor() as cursor:
-            await cursor.executemany(PsycopgAdapter.INSERT, rows)
+            await cursor.executemany(cls.INSERT, rows)
 
 
 _BY_MODULE: dict[str, type[Adapter]] = {

@@ -91,22 +91,13 @@ const FETCH: &str = "
     RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts
 ";
 
-const COMPLETE: &str = "
-    UPDATE gylo_job
-    SET state = 'completed',
-        finalized_at = now(),
-        locked_by = NULL,
-        lease_expires_at = NULL
-    WHERE id = $1 AND state = 'running'
-";
-
 const COMPLETE_MANY: &str = "
     UPDATE gylo_job
     SET state = 'completed',
         finalized_at = now(),
         locked_by = NULL,
         lease_expires_at = NULL
-    WHERE id = ANY($1) AND state = 'running'
+    WHERE id = ANY($1) AND locked_by = $2 AND state = 'running'
 ";
 
 const DISCARD_MANY: &str = "
@@ -121,7 +112,7 @@ const DISCARD_MANY: &str = "
             'error', v.error
         )
     FROM unnest($1::bigint[], $2::text[]) AS v(id, error)
-    WHERE j.id = v.id AND j.state = 'running'
+    WHERE j.id = v.id AND j.locked_by = $3 AND j.state = 'running'
 ";
 
 const DISCARD: &str = "
@@ -133,9 +124,9 @@ const DISCARD: &str = "
         errors = errors || jsonb_build_object(
             'attempt', attempt,
             'at', now(),
-            'error', $2::text
+            'error', $3::text
         )
-    WHERE id = $1 AND state = 'running'
+    WHERE id = $1 AND locked_by = $2 AND state = 'running'
 ";
 
 const RECLAIM: &str = "
@@ -179,15 +170,19 @@ const RECLAIM: &str = "
 
 const RENEW: &str = "
     UPDATE gylo_job
-    SET lease_expires_at = now() + make_interval(secs => $2)
-    WHERE id = ANY($1) AND state = 'running'
+    SET lease_expires_at = now() + make_interval(secs => $3)
+    WHERE id = ANY($1) AND locked_by = $2 AND state = 'running'
 ";
 
 /// Extends the lease on jobs still being worked, so a task that outlives its
 /// original lease is not reclaimed and run a second time.
+///
+/// Scoped to the holder: a worker whose lease already lapsed must not extend
+/// the one another worker has since taken.
 pub async fn renew_leases<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
+    worker: Uuid,
     lease: Duration,
 ) -> Result<u64, Error> {
     if ids.is_empty() {
@@ -195,6 +190,7 @@ pub async fn renew_leases<'e, E: PgExecutor<'e>>(
     }
     let result = sqlx::query(RENEW)
         .bind(ids)
+        .bind(worker)
         .bind(lease.as_secs_f64())
         .execute(executor)
         .await?;
@@ -220,7 +216,8 @@ const RETRY_MANY: &str = "
                 'error', i.error
             )
         FROM input i
-        WHERE j.id = i.id AND j.state = 'running' AND j.attempt < j.max_attempts
+        WHERE j.id = i.id AND j.locked_by = $5 AND j.state = 'running'
+              AND j.attempt < j.max_attempts
         RETURNING j.id
     ),
     exhausted AS (
@@ -235,7 +232,8 @@ const RETRY_MANY: &str = "
                 'error', i.error
             )
         FROM input i
-        WHERE j.id = i.id AND j.state = 'running' AND j.attempt >= j.max_attempts
+        WHERE j.id = i.id AND j.locked_by = $5 AND j.state = 'running'
+              AND j.attempt >= j.max_attempts
         RETURNING j.id
     )
     SELECT
@@ -262,6 +260,7 @@ pub async fn retry_many<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
     errors: &[String],
+    worker: Uuid,
     base: Duration,
     cap: Duration,
 ) -> Result<Retried, Error> {
@@ -274,6 +273,7 @@ pub async fn retry_many<'e, E: PgExecutor<'e>>(
         .bind(errors)
         .bind(base.as_secs_f64())
         .bind(cap.as_secs_f64())
+        .bind(worker)
         .fetch_one(executor)
         .await?;
     Ok(Retried {
@@ -285,16 +285,24 @@ pub async fn retry_many<'e, E: PgExecutor<'e>>(
 const ABANDON: &str = "
     UPDATE gylo_job
     SET lease_expires_at = now() - interval '1 microsecond'
-    WHERE id = ANY($1) AND state = 'running'
+    WHERE id = ANY($1) AND locked_by = $2 AND state = 'running'
 ";
 
 /// Expires leases the caller knows it can no longer honour, so the next sweep
 /// recovers them immediately instead of after the full lease duration.
-pub async fn abandon_leases<'e, E: PgExecutor<'e>>(executor: E, ids: &[i64]) -> Result<u64, Error> {
+pub async fn abandon_leases<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    worker: Uuid,
+) -> Result<u64, Error> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let result = sqlx::query(ABANDON).bind(ids).execute(executor).await?;
+    let result = sqlx::query(ABANDON)
+        .bind(ids)
+        .bind(worker)
+        .execute(executor)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -374,34 +382,36 @@ pub async fn fetch<'e, E: PgExecutor<'e>>(
         .collect()
 }
 
-/// Returns whether the job was still leased, and so actually finalised.
-pub async fn complete<'e, E: PgExecutor<'e>>(executor: E, id: i64) -> Result<bool, Error> {
-    let result = sqlx::query(COMPLETE).bind(id).execute(executor).await?;
-    Ok(result.rows_affected() == 1)
-}
-
 /// Every failure is terminal until retry scheduling exists; this always moves
 /// the job to the dead-letter state rather than back to `available`.
 pub async fn discard<'e, E: PgExecutor<'e>>(
     executor: E,
     id: i64,
+    worker: Uuid,
     error: &str,
 ) -> Result<bool, Error> {
     let result = sqlx::query(DISCARD)
         .bind(id)
+        .bind(worker)
         .bind(error)
         .execute(executor)
         .await?;
     Ok(result.rows_affected() == 1)
 }
 
-/// One statement, one commit, rather than one of each per job.
-pub async fn complete_many<'e, E: PgExecutor<'e>>(executor: E, ids: &[i64]) -> Result<u64, Error> {
+/// Returns how many were still leased, and so actually finalised. One
+/// statement and one commit, rather than one of each per job.
+pub async fn complete_many<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    worker: Uuid,
+) -> Result<u64, Error> {
     if ids.is_empty() {
         return Ok(0);
     }
     let result = sqlx::query(COMPLETE_MANY)
         .bind(ids)
+        .bind(worker)
         .execute(executor)
         .await?;
     Ok(result.rows_affected())
@@ -413,6 +423,7 @@ pub async fn discard_many<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
     errors: &[String],
+    worker: Uuid,
 ) -> Result<u64, Error> {
     debug_assert_eq!(ids.len(), errors.len());
     if ids.is_empty() {
@@ -421,6 +432,7 @@ pub async fn discard_many<'e, E: PgExecutor<'e>>(
     let result = sqlx::query(DISCARD_MANY)
         .bind(ids)
         .bind(errors)
+        .bind(worker)
         .execute(executor)
         .await?;
     Ok(result.rows_affected())

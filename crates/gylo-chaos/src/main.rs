@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 
 const DSN: &str = "postgres://gylo:gylo@127.0.0.1:5442/gylo_dev";
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+const CONTAINER: &str = "gylo-postgres-1";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,12 +207,47 @@ impl Harness {
     }
 }
 
+/// Direct children of the worker we spawned.
+///
+/// Scoped by parent pid rather than matched by name, so the harness cannot
+/// kill a worker someone else is running on the same machine.
+async fn children_of(worker: &Child) -> Vec<u32> {
+    let Some(pid) = worker.id() else {
+        return Vec::new();
+    };
+    Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .await
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn kill_all(pids: &[u32]) -> bool {
+    let mut killed = false;
+    for pid in pids {
+        killed |= Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    killed
+}
+
 /// Polls rather than sampling once, because a respawn takes a moment and a
 /// single sample taken during the gap reports a failure that did not happen.
-async fn awaits_respawn(within: Duration) -> bool {
+async fn awaits_respawn(worker: &Child, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if python_children().await > 0 {
+        if !children_of(worker).await.is_empty() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -219,31 +255,15 @@ async fn awaits_respawn(within: Duration) -> bool {
     false
 }
 
-/// Counts matching pids by line. `pgrep -c` is a Linux extension that macOS
-/// does not have, and silently returns nothing there.
-async fn python_children() -> usize {
-    Command::new("pgrep")
-        .args(["-f", "gylo._worker"])
-        .output()
-        .await
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
-        .unwrap_or(0)
-}
-
-async fn kill_python_children() -> bool {
-    Command::new("pkill")
-        .args(["-9", "-f", "gylo._worker"])
-        .status()
-        .await
-        .map(|status| status.success())
-        .unwrap_or(false)
+async fn teardown(mut worker: Child) {
+    let children = children_of(&worker).await;
+    let _ = worker.kill().await;
+    kill_all(&children).await;
 }
 
 async fn scenario_child_kill(harness: &Harness) -> Verdict {
     harness.reset().await;
-    let mut worker = harness.spawn_worker();
+    let worker = harness.spawn_worker();
 
     let mut faults = 0;
     let mut outstanding = Vec::new();
@@ -253,19 +273,19 @@ async fn scenario_child_kill(harness: &Harness) -> Verdict {
         let Some(left) = harness.wait_until_busy().await else {
             break;
         };
-        if kill_python_children().await {
+        let children = children_of(&worker).await;
+        if kill_all(&children).await {
             faults += 1;
             outstanding.push(left);
         }
         if round == 0 {
-            respawned = Some(awaits_respawn(Duration::from_secs(5)).await);
+            respawned = Some(awaits_respawn(&worker, Duration::from_secs(5)).await);
         }
         tokio::time::sleep(Duration::from_millis(1200)).await;
     }
 
     let settled = harness.settle().await;
-    let _ = worker.kill().await;
-    kill_python_children().await;
+    teardown(worker).await;
 
     let note = match respawned {
         Some(false) => Some(
@@ -296,8 +316,9 @@ async fn scenario_worker_kill(harness: &Harness) -> Verdict {
         let Some(left) = harness.wait_until_busy().await else {
             break;
         };
+        let children = children_of(&worker).await;
         let _ = worker.kill().await;
-        kill_python_children().await;
+        kill_all(&children).await;
         faults += 1;
         outstanding.push(left);
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -305,8 +326,7 @@ async fn scenario_worker_kill(harness: &Harness) -> Verdict {
     }
 
     let settled = harness.settle().await;
-    let _ = worker.kill().await;
-    kill_python_children().await;
+    teardown(worker).await;
 
     harness
         .report(Outcome {
@@ -321,16 +341,15 @@ async fn scenario_worker_kill(harness: &Harness) -> Verdict {
 
 async fn scenario_postgres_restart(harness: &Harness) -> Verdict {
     harness.reset().await;
-    let mut worker = harness.spawn_worker();
+    let worker = harness.spawn_worker();
     let mut faults = 0;
     let mut outstanding = Vec::new();
 
     if let Some(left) = harness.wait_until_busy().await {
-        let compose = harness.root.join(".claude/docker-compose.yml");
+        let container =
+            std::env::var("GYLO_CHAOS_CONTAINER").unwrap_or_else(|_| CONTAINER.to_owned());
         let restarted = Command::new("docker")
-            .args(["compose", "-f"])
-            .arg(&compose)
-            .args(["restart", "postgres"])
+            .args(["restart", &container])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -344,8 +363,7 @@ async fn scenario_postgres_restart(harness: &Harness) -> Verdict {
     }
 
     let settled = harness.settle().await;
-    let _ = worker.kill().await;
-    kill_python_children().await;
+    teardown(worker).await;
 
     harness
         .report(Outcome {

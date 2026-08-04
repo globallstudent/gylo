@@ -387,6 +387,38 @@ async fn an_undecodable_payload_is_not_retried(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn a_lease_shorter_than_the_maintenance_interval_is_rejected(pool: PgPool) {
+    let config = Config {
+        lease: Duration::from_secs(5),
+        maintenance_interval: Duration::from_secs(30),
+        ..config()
+    };
+
+    let error = run(pool, config, CancellationToken::new())
+        .await
+        .expect_err("this config silently re-runs healthy jobs, so it must not start");
+
+    assert!(
+        error.to_string().contains("must be shorter than the lease"),
+        "got {error}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_empty_app_path_is_rejected(pool: PgPool) {
+    let config = Config {
+        app: String::new(),
+        ..config()
+    };
+
+    assert!(
+        run(pool, config, CancellationToken::new())
+            .await
+            .is_err_and(|error| error.to_string().contains("module:attribute"))
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn a_child_that_cannot_start_gives_up_with_its_error(pool: PgPool) {
     let config = Config {
         app: "no_such_module:app".to_owned(),
