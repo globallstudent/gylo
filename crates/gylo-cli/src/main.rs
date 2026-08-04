@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -40,9 +39,19 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         batch: i64,
 
-        /// Seconds a lease is held before another worker may reclaim it.
-        #[arg(long, default_value_t = 30)]
-        lease: u64,
+        /// How long a lease is held before another worker may reclaim it.
+        #[arg(long, default_value = "30s")]
+        lease: humantime::Duration,
+
+        /// How long to wait before polling again when the queue is empty.
+        /// Notifications normally arrive first, so this is a safety net.
+        #[arg(long, default_value = "200ms")]
+        poll_interval: humantime::Duration,
+
+        /// How often to renew held leases and reclaim abandoned ones. Must
+        /// stay well below the lease.
+        #[arg(long, default_value = "10s")]
+        maintenance_interval: humantime::Duration,
 
         /// Interpreter to run task code with.
         #[arg(long, default_value = "python3", env = "GYLO_PYTHON")]
@@ -91,6 +100,8 @@ async fn main() -> Result<()> {
             concurrency,
             batch,
             lease,
+            poll_interval,
+            maintenance_interval,
             python,
             python_path,
             pool_size,
@@ -100,7 +111,9 @@ async fn main() -> Result<()> {
                 queue,
                 concurrency,
                 batch,
-                lease: Duration::from_secs(lease),
+                lease: lease.into(),
+                poll_interval: poll_interval.into(),
+                maintenance_interval: maintenance_interval.into(),
                 python,
                 app,
                 python_path,

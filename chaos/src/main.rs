@@ -80,13 +80,18 @@ impl Harness {
         }
     }
 
+    /// Drives the binary that actually ships, so the harness cannot pass
+    /// against a worker configured differently from the real one.
     fn spawn_worker(&self) -> Child {
-        Command::new(self.root.join("target/release/chaos-worker"))
+        Command::new(self.root.join("target/release/gylo"))
+            .args(["worker", "--app", "app:app"])
+            .args(["--concurrency", "16", "--batch", "8"])
+            .args(["--lease", "2s", "--maintenance-interval", "400ms"])
+            .args(["--poll-interval", "100ms"])
             .env("DATABASE_URL", DSN)
-            .env("GYLO_CHAOS_APP", "app:app")
-            .env("GYLO_CHAOS_PYTHON", self.root.join(".venv/bin/python3"))
+            .env("GYLO_PYTHON", self.root.join(".venv/bin/python3"))
             .env(
-                "GYLO_CHAOS_PYTHONPATH",
+                "PYTHONPATH",
                 format!(
                     "{}:{}",
                     self.root.join("python").display(),
@@ -98,7 +103,7 @@ impl Harness {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .expect("spawning chaos-worker")
+            .expect("spawning gylo worker")
     }
 
     async fn unfinished(&self) -> i64 {
