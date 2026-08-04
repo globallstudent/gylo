@@ -594,9 +594,15 @@ async fn a_child_that_cannot_start_gives_up_with_its_error(pool: PgPool) {
         .await
         .expect_err("a worker whose app cannot be imported must not run forever");
 
+    let reported = error.to_string();
     assert!(
-        error.to_string().contains("python child exited"),
-        "the operator needs the real cause, got {error}"
+        reported.contains("python child exited"),
+        "the operator needs the real cause, got {reported}"
+    );
+    assert!(
+        reported.contains("No module named 'no_such_module'"),
+        "an exit status alone does not say what is wrong; the child's own last \
+         words are the only thing that names the misconfiguration, got {reported}"
     );
 }
 

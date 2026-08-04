@@ -4,7 +4,7 @@
 //! Dispatch and completion run as independent tasks over the same socket, so
 //! neither direction waits on a round trip.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,7 +15,7 @@ mod observe;
 use chrono::Utc;
 use gylo_core::{Decoder, Message, Outcome, Schedule, encode};
 use sqlx::PgPool;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
@@ -385,16 +385,17 @@ async fn session(
     let guard = SocketGuard(path.clone());
     let listener = UnixListener::bind(&path)?;
     let mut child = spawn_child(config, &path)?;
+    let said = LastWords::default();
+    if let Some(stderr) = child.stderr.take() {
+        said.watch(stderr);
+    }
 
     let accepted = tokio::select! {
         result = tokio::time::timeout(HANDSHAKE_TIMEOUT, listener.accept()) => {
             result.map_err(|_| Error::HandshakeTimeout(HANDSHAKE_TIMEOUT))??
         }
         status = child.wait() => {
-            return Err(Error::ChildExited(match status {
-                Ok(status) => status.to_string(),
-                Err(error) => error.to_string(),
-            }));
+            return Err(exited(status, &said));
         }
     };
     let (reader, writer) = accepted.0.into_split();
@@ -422,10 +423,7 @@ async fn session(
             },
             ack_rx,
         ) => result,
-        status = child.wait() => Err(Error::ChildExited(match status {
-            Ok(status) => status.to_string(),
-            Err(error) => error.to_string(),
-        })),
+        status = child.wait() => Err(exited(status, &said)),
     };
 
     if shutdown.is_cancelled() {
@@ -938,6 +936,10 @@ fn spawn_child(config: &Config, socket: &Path) -> std::io::Result<Child> {
         .arg(socket)
         .arg("--app")
         .arg(&config.app)
+        // captured rather than inherited so it can be attributed to a child and
+        // quoted back when one dies. An import error is the operator's only
+        // clue about why, and raw on the terminal it belongs to no one
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
     if let Some(path) = &config.python_path {
@@ -947,6 +949,55 @@ fn spawn_child(config: &Config, socket: &Path) -> std::io::Result<Child> {
         command.env(key, value);
     }
     command.spawn()
+}
+
+/// Names why a child died, preferring what it said over what it returned.
+fn exited(status: std::io::Result<std::process::ExitStatus>, said: &LastWords) -> Error {
+    let reported = match status {
+        Ok(status) => status.to_string(),
+        Err(error) => error.to_string(),
+    };
+    let tail = said.tail();
+    Error::ChildExited(if tail.is_empty() {
+        reported
+    } else {
+        format!("{reported}: {tail}")
+    })
+}
+
+/// The last thing a child said before it died.
+///
+/// Bounded because a chatty child must not grow this without limit, and only
+/// the end is wanted: a traceback puts its cause on the final line.
+#[derive(Clone, Default)]
+struct LastWords(Arc<Mutex<VecDeque<String>>>);
+
+const LAST_WORDS: usize = 20;
+
+impl LastWords {
+    fn watch(&self, stderr: tokio::process::ChildStderr) {
+        let lines = Arc::clone(&self.0);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                tracing::warn!(target: "gylo::child", "{line}");
+                let mut held = lines.lock().expect("child output is not poisoned");
+                if held.len() == LAST_WORDS {
+                    held.pop_front();
+                }
+                held.push_back(line);
+            }
+        });
+    }
+
+    fn tail(&self) -> String {
+        let held = self.0.lock().expect("child output is not poisoned");
+        held.iter()
+            .rev()
+            .find(|line| !line.trim().is_empty() && !line.starts_with(' '))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 fn socket_path() -> PathBuf {
