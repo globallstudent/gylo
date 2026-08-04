@@ -1,0 +1,69 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "gylo"
+version = "0.1.0a1"
+description = "A distributed task queue for Python with a Rust core"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Asliddin" }]
+keywords = ["task-queue", "jobs", "background", "postgres", "asyncio", "workers"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Rust",
+  "Topic :: System :: Distributed Computing",
+  "Typing :: Typed",
+]
+
+# msgspec encodes the payload and nothing else is needed at run time. A queue
+# that drags a driver, a broker client and a CLI framework into every service
+# that merely enqueues is the thing this is reacting to.
+dependencies = ["msgspec>=0.18"]
+
+[project.optional-dependencies]
+asyncpg = ["asyncpg>=0.29"]
+psycopg = ["psycopg[binary]>=3.1"]
+sqlalchemy = ["sqlalchemy>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/globallstudent/gylo"
+Source = "https://github.com/globallstudent/gylo"
+Issues = "https://github.com/globallstudent/gylo/issues"
+
+[tool.maturin]
+manifest-path = "crates/gylo-cli/Cargo.toml"
+bindings = "bin"
+python-source = "python"
+strip = true
+# the migrations are embedded into the binary at compile time, so a source
+# build without them does not fail at run time — it fails to compile
+include = [{ path = "migrations/**/*", format = "sdist" }]
+
+[dependency-groups]
+dev = [
+  "asyncpg>=0.29",
+  "maturin>=1.9",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+]
+# Only the benchmark harness needs these, and it compares gylo against them.
+# They must never reach an install of gylo itself.
+bench = [
+  "arq>=0.26",
+  "celery>=5.4",
+  "dramatiq[redis]>=1.17",
+  "redis>=5.0",
+  "taskiq>=0.11",
+  "taskiq-redis>=1.0",
+]

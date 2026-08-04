@@ -3,6 +3,8 @@ name = "gylo-redis"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+description = "Redis backend for gylo"
+repository.workspace = true
 
 [dependencies]
 gylo-core = { version = "0.1.0", path = "../gylo-core" }

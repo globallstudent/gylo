@@ -6,13 +6,16 @@ use gylo_core::Feature;
 use gylo_redis::Backend;
 use tokio::sync::Mutex;
 
-const URL: &str = "redis://127.0.0.1:6389/1";
+/// The dev default is the local compose port; CI runs Redis somewhere else.
+fn url() -> String {
+    std::env::var("GYLO_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6389/1".to_owned())
+}
 const LEASE: Duration = Duration::from_secs(30);
 
 /// Each test gets its own namespace, so the suite can run in parallel against
 /// one server without tests clearing each other's jobs.
 async fn fresh(namespace: &str) -> Backend {
-    let mut backend = Backend::connect_namespaced(URL, namespace)
+    let mut backend = Backend::connect_namespaced(&url(), namespace)
         .await
         .expect("redis is not running");
     backend.clear().await.unwrap();
@@ -149,10 +152,12 @@ async fn concurrent_consumers_never_get_the_same_job() {
         let seen = Arc::clone(&seen);
         let counted = Arc::clone(&counted);
         handles.push(tokio::spawn(async move {
-            let mut backend =
-                Backend::connect_namespaced(URL, "t:concurrent_consumers_never_get_the_same_job")
-                    .await
-                    .unwrap();
+            let mut backend = Backend::connect_namespaced(
+                &url(),
+                "t:concurrent_consumers_never_get_the_same_job",
+            )
+            .await
+            .unwrap();
             loop {
                 let jobs = backend.fetch(50, LEASE).await.unwrap();
                 if jobs.is_empty() {
