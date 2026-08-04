@@ -35,27 +35,41 @@ def load_app(path: str) -> Gylo:
         raise ValueError(f"{module_name!r} has no attribute {attribute!r}") from None
 
 
+async def _fail(writer: asyncio.StreamWriter, job_id: int, *, retry: bool) -> None:
+    writer.write(encode_failure(job_id, traceback.format_exc(), retry=retry))
+    await writer.drain()
+
+
 async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -> None:
-    task = None
+    """Run one job and report how it went.
+
+    Only a failure raised by the task body consults the retry policy. An
+    unregistered name and an undecodable payload are settled permanently,
+    because neither can come out differently on another attempt.
+    """
     try:
         task = app.get(message.task)
+    except UnknownTaskError:
+        await _fail(writer, message.id, retry=False)
+        return
+
+    try:
         args: list[Any]
         kwargs: dict[str, Any]
-        if message.payload:
-            args, kwargs = _decode_payload(message.payload)
-        else:
-            args, kwargs = [], {}
+        args, kwargs = _decode_payload(message.payload) if message.payload else ([], {})
+    except Exception:
+        await _fail(writer, message.id, retry=False)
+        return
 
+    try:
         result = task.fn(*args, **kwargs)
         if inspect.isawaitable(result):
             await result
-    except UnknownTaskError:
-        writer.write(encode_failure(message.id, traceback.format_exc(), retry=False))
     except Exception as error:
-        retry = task.should_retry(error) if task is not None else False
-        writer.write(encode_failure(message.id, traceback.format_exc(), retry=retry))
-    else:
-        writer.write(encode_success(message.id))
+        await _fail(writer, message.id, retry=task.should_retry(error))
+        return
+
+    writer.write(encode_success(message.id))
     await writer.drain()
 
 

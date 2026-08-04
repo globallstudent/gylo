@@ -371,6 +371,40 @@ async fn raising_no_retry_ends_the_job_immediately(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn an_undecodable_payload_is_not_retried(pool: PgPool) {
+    let mut job = NewJob::new("ok", vec![0xC1]);
+    job.max_attempts = 10;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(state_of(&pool, id).await, "discarded");
+    assert_eq!(
+        attempt_of(&pool, id).await,
+        1,
+        "a payload that cannot decode will never decode, so retrying it burns attempts for nothing"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_child_that_cannot_start_gives_up_with_its_error(pool: PgPool) {
+    let config = Config {
+        app: "no_such_module:app".to_owned(),
+        max_restarts: 1,
+        ..config()
+    };
+
+    let error = run(pool, config, CancellationToken::new())
+        .await
+        .expect_err("a worker whose app cannot be imported must not run forever");
+
+    assert!(
+        error.to_string().contains("python child exited"),
+        "the operator needs the real cause, got {error}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn a_batch_of_jobs_all_complete(pool: PgPool) {
     for _ in 0..250 {
         enqueue(&pool, &NewJob::new("ok", Vec::new()))

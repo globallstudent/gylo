@@ -63,13 +63,13 @@ class PsycopgAdapter:
             await cursor.executemany(PsycopgAdapter.INSERT, rows)
 
 
-_BY_MODULE: dict[str, type[AsyncpgAdapter] | type[PsycopgAdapter]] = {
+_BY_MODULE: dict[str, type[Adapter]] = {
     "asyncpg": AsyncpgAdapter,
     "psycopg": PsycopgAdapter,
 }
 
 
-def adapter_for(conn: Any) -> Any:
+def adapter_for(conn: Any) -> type[Adapter]:
     """Pick an adapter from the connection's own module.
 
     Matching on the module rather than the exact class keeps pools, connection

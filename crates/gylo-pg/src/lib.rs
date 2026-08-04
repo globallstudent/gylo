@@ -32,7 +32,6 @@ pub struct NewJob {
     /// Lower runs first.
     pub priority: i16,
     pub max_attempts: i16,
-    /// Delay before the job becomes eligible to run.
     pub delay: Duration,
 }
 

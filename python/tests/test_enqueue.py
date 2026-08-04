@@ -62,14 +62,9 @@ async def test_enqueue_is_rolled_back_with_the_caller_transaction(conn):
 
 
 async def test_options_reach_the_row(conn):
-    job_id = await send_receipt.enqueue(
-        conn,
-        1,
-        email="a@b.c",
-        queue="receipts",
-        priority=3,
-        max_attempts=5,
-    )
+    job_id = await send_receipt.options(
+        queue="receipts", priority=3, max_attempts=5
+    ).enqueue(conn, 1, email="a@b.c")
 
     record = await row(conn, job_id)
     assert record["queue"] == "receipts"
@@ -78,7 +73,7 @@ async def test_options_reach_the_row(conn):
 
 
 async def test_delay_pushes_the_schedule_out(conn):
-    job_id = await send_receipt.enqueue(conn, 1, email="a@b.c", delay=60)
+    job_id = await send_receipt.options(delay=60).enqueue(conn, 1, email="a@b.c")
 
     ahead = await conn.fetchval(
         "SELECT EXTRACT(EPOCH FROM (scheduled_at - now())) FROM gylo_job WHERE id = $1",
@@ -88,10 +83,9 @@ async def test_delay_pushes_the_schedule_out(conn):
 
 
 async def test_enqueue_many_inserts_every_call(conn):
-    await send_receipt.enqueue_many(
+    await send_receipt.options(queue="bulk").enqueue_many(
         conn,
         [((i,), {"email": f"user{i}@example.com"}) for i in range(25)],
-        queue="bulk",
     )
 
     assert await count(conn) == 25
@@ -110,3 +104,30 @@ async def test_enqueue_many_with_nothing_to_do_is_a_no_op(conn):
 async def test_an_unrecognised_connection_is_rejected():
     with pytest.raises(UnsupportedDriverError, match="no gylo adapter"):
         await send_receipt.enqueue(object(), 1, email="a@b.c")
+
+
+async def test_options_do_not_collide_with_task_arguments(conn):
+    collide = Gylo()
+
+    @collide.task(name="collide")
+    async def ship(*, queue: str, priority: int) -> None:
+        pass
+
+    job_id = await ship.options(queue="shipping").enqueue(
+        conn, queue="ground", priority=9
+    )
+
+    record = await row(conn, job_id)
+    assert record["queue"] == "shipping", "the option should route the job"
+    assert record["priority"] == 0, "the task argument must not become the option"
+
+    _, kwargs = msgspec.msgpack.decode(record["payload"])
+    assert kwargs == {"queue": "ground", "priority": 9}
+
+
+async def test_options_leave_the_task_defaults_alone(conn):
+    await send_receipt.options(queue="once").enqueue(conn, 1, email="a@b.c")
+    job_id = await send_receipt.enqueue(conn, 2, email="a@b.c")
+
+    record = await row(conn, job_id)
+    assert record["queue"] == "default"

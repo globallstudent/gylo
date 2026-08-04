@@ -24,6 +24,9 @@ const READ_BUFFER: usize = 1 << 16;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const LISTEN_RETRY: Duration = Duration::from_secs(1);
 const RESTART_DELAY: Duration = Duration::from_millis(250);
+const RESTART_CEILING: Duration = Duration::from_secs(30);
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DATABASE_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +69,10 @@ pub struct Config {
     pub retry_base: Duration,
     /// Ceiling on the doubling, before jitter.
     pub retry_cap: Duration,
+    /// Consecutive failed sessions tolerated before the worker gives up. A
+    /// session that stayed healthy resets the count, so this only catches a
+    /// child that cannot stay up at all — usually a misconfigured `app`.
+    pub max_restarts: u32,
     pub python: PathBuf,
     /// `module:attribute` path to the user's app object.
     pub app: String,
@@ -86,6 +93,7 @@ impl Default for Config {
             reclaim_limit: 1000,
             retry_base: Duration::from_secs(1),
             retry_cap: Duration::from_secs(3600),
+            max_restarts: 8,
             python: PathBuf::from("python3"),
             app: String::new(),
             python_path: None,
@@ -199,15 +207,37 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
         shutdown.clone(),
     ));
 
+    let mut consecutive: u32 = 0;
+    let mut outcome = Ok(());
+
     while !shutdown.is_cancelled() {
+        let started = tokio::time::Instant::now();
         match session(&pool, &config, &inflight, &wakeup, &shutdown).await {
             Ok(()) => break,
             Err(error) => {
-                tracing::error!(%error, "worker session ended, restarting the python child");
+                if started.elapsed() >= HEALTHY_SESSION {
+                    consecutive = 0;
+                }
+                consecutive += 1;
                 hand_back(&pool, &inflight, &config).await;
+
+                if consecutive > config.max_restarts {
+                    tracing::error!(
+                        %error,
+                        restarts = consecutive - 1,
+                        "python child keeps failing to stay up, giving up"
+                    );
+                    outcome = Err(error);
+                    break;
+                }
+
+                let backoff = RESTART_DELAY
+                    .saturating_mul(1 << (consecutive - 1).min(16))
+                    .min(RESTART_CEILING);
+                tracing::error!(%error, ?backoff, "worker session ended, restarting");
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(RESTART_DELAY) => {}
+                    () = tokio::time::sleep(backoff) => {}
                 }
             }
         }
@@ -215,7 +245,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
 
     listening.abort();
     maintaining.abort();
-    Ok(())
+    outcome
 }
 
 /// Releases whatever the dead session was holding so another attempt can start
@@ -252,10 +282,17 @@ async fn session(
     let listener = UnixListener::bind(&path)?;
     let mut child = spawn_child(config, &path)?;
 
-    let handshake = Duration::from_secs(30);
-    let accepted = tokio::time::timeout(handshake, listener.accept())
-        .await
-        .map_err(|_| Error::HandshakeTimeout(handshake))??;
+    let accepted = tokio::select! {
+        result = tokio::time::timeout(HANDSHAKE_TIMEOUT, listener.accept()) => {
+            result.map_err(|_| Error::HandshakeTimeout(HANDSHAKE_TIMEOUT))??
+        }
+        status = child.wait() => {
+            return Err(Error::ChildExited(match status {
+                Ok(status) => status.to_string(),
+                Err(error) => error.to_string(),
+            }));
+        }
+    };
     let (reader, writer) = accepted.0.into_split();
 
     let completions = tokio::spawn(collect_completions(
