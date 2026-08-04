@@ -120,11 +120,11 @@ async fn a_synchronous_task_is_supported(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_raising_task_is_discarded_with_its_traceback(pool: PgPool) {
-    let id = enqueue(&pool, &NewJob::new("boom", Vec::new()))
-        .await
-        .unwrap();
+    let mut job = NewJob::new("boom", Vec::new());
+    job.max_attempts = 1;
+    let id = enqueue(&pool, &job).await.unwrap();
 
-    run_until_settled(&pool).await;
+    run_until_settled_with(&pool, quick_retries()).await;
 
     assert_eq!(state_of(&pool, id).await, "discarded");
 
@@ -184,10 +184,13 @@ async fn one_batch_carrying_both_outcomes_finalises_each_correctly(pool: PgPool)
     let mut expected_ok = Vec::new();
     let mut expected_boom = Vec::new();
     for i in 0..40 {
-        let task = if i % 2 == 0 { "ok" } else { "boom" };
-        let id = enqueue(&pool, &NewJob::new(task, Vec::new()))
-            .await
-            .unwrap();
+        let mut job = if i % 2 == 0 {
+            NewJob::new("ok", Vec::new())
+        } else {
+            NewJob::new("boom", Vec::new())
+        };
+        job.max_attempts = 1;
+        let id = enqueue(&pool, &job).await.unwrap();
         if i % 2 == 0 {
             expected_ok.push(id);
         } else {
@@ -195,7 +198,7 @@ async fn one_batch_carrying_both_outcomes_finalises_each_correctly(pool: PgPool)
         }
     }
 
-    run_until_settled(&pool).await;
+    run_until_settled_with(&pool, quick_retries()).await;
 
     for id in expected_ok {
         assert_eq!(state_of(&pool, id).await, "completed");
@@ -277,6 +280,94 @@ async fn lease_renewal_keeps_a_long_task_from_being_run_twice(pool: PgPool) {
         attempt, 1,
         "the task outlives its lease, so without renewal it would be reclaimed and run again"
     );
+}
+
+async fn attempt_of(pool: &PgPool, id: i64) -> i16 {
+    sqlx::query("SELECT attempt FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get(0)
+}
+
+fn quick_retries() -> Config {
+    Config {
+        retry_base: Duration::from_millis(10),
+        retry_cap: Duration::from_millis(50),
+        ..config()
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_transient_failure_is_retried_and_then_succeeds(pool: PgPool) {
+    let id = enqueue(
+        &pool,
+        &NewJob::new("flaky", payload(&[], &[("marker", "1")])),
+    )
+    .await
+    .unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(state_of(&pool, id).await, "completed");
+    assert_eq!(
+        attempt_of(&pool, id).await,
+        2,
+        "the job should have failed once and succeeded on the retry"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retryable_failure_records_every_attempt(pool: PgPool) {
+    let mut job = NewJob::new("boom", Vec::new());
+    job.max_attempts = 3;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(state_of(&pool, id).await, "discarded");
+    assert_eq!(attempt_of(&pool, id).await, 3);
+
+    let errors: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        errors.as_array().unwrap().len(),
+        3,
+        "every attempt should leave a record, not just the last"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_excluded_exception_type_is_not_retried(pool: PgPool) {
+    let mut job = NewJob::new("fatal", Vec::new());
+    job.max_attempts = 10;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(state_of(&pool, id).await, "discarded");
+    assert_eq!(
+        attempt_of(&pool, id).await,
+        1,
+        "no_retry_on should end the job on its first attempt"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn raising_no_retry_ends_the_job_immediately(pool: PgPool) {
+    let mut job = NewJob::new("refused", Vec::new());
+    job.max_attempts = 10;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(state_of(&pool, id).await, "discarded");
+    assert_eq!(attempt_of(&pool, id).await, 1);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

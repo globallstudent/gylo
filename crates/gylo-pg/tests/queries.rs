@@ -240,6 +240,129 @@ async fn empty_batches_are_a_no_op(pool: PgPool) {
     assert_eq!(discard_many(&pool, &[], &[]).await.unwrap(), 0);
 }
 
+async fn scheduled_in(pool: &PgPool, id: i64) -> f64 {
+    sqlx::query(
+        "SELECT (EXTRACT(EPOCH FROM (scheduled_at - now())))::float8 FROM gylo_job WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get(0)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_job_is_rescheduled_with_backoff(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+
+    let retried = gylo_pg::retry_many(
+        &pool,
+        &[id],
+        &["boom".to_owned()],
+        Duration::from_secs(10),
+        Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(retried.scheduled, 1);
+    assert_eq!(retried.exhausted, 0);
+    assert_eq!(state_of(&pool, id).await, "available");
+
+    let delay = scheduled_in(&pool, id).await;
+    assert!(
+        (5.0..=10.0).contains(&delay),
+        "first attempt should land within the jittered 50-100% band, got {delay}"
+    );
+    assert!(
+        fetch(&pool, "default", 10, LEASE, worker())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a job waiting out its backoff must not be eligible yet"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn backoff_grows_with_each_attempt(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    let mut previous = 0.0;
+
+    for _ in 0..4 {
+        sqlx::query("UPDATE gylo_job SET scheduled_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+        gylo_pg::retry_many(
+            &pool,
+            &[id],
+            &["boom".to_owned()],
+            Duration::from_secs(1),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        let delay = scheduled_in(&pool, id).await;
+        assert!(
+            delay > previous,
+            "attempt delay {delay} did not exceed the previous {previous}"
+        );
+        previous = delay;
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn backoff_is_capped(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    sqlx::query("UPDATE gylo_job SET attempt = 20, max_attempts = 100, state = 'running', locked_by = gen_random_uuid(), lease_expires_at = now() + interval '1 minute' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    gylo_pg::retry_many(
+        &pool,
+        &[id],
+        &["boom".to_owned()],
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    let delay = scheduled_in(&pool, id).await;
+    assert!(
+        delay <= 60.0,
+        "2^19 seconds must be clamped to the cap, got {delay}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failure_on_the_last_attempt_is_dead_lettered(pool: PgPool) {
+    let mut job = NewJob::new("t", Vec::new());
+    job.max_attempts = 1;
+    let id = enqueue(&pool, &job).await.unwrap();
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+
+    let retried = gylo_pg::retry_many(
+        &pool,
+        &[id],
+        &["boom".to_owned()],
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(retried.scheduled, 0);
+    assert_eq!(retried.exhausted, 1);
+    assert_eq!(state_of(&pool, id).await, "discarded");
+}
+
 async fn expire_lease(pool: &PgPool, id: i64) {
     sqlx::query("UPDATE gylo_job SET lease_expires_at = now() - interval '1 second' WHERE id = $1")
         .bind(id)

@@ -17,7 +17,7 @@ from typing import Any
 
 import msgspec
 
-from . import Gylo
+from . import Gylo, UnknownTaskError
 from ._protocol import Decoder, Dispatch, encode_failure, encode_success
 
 READ_BYTES = 1 << 16
@@ -36,6 +36,7 @@ def load_app(path: str) -> Gylo:
 
 
 async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -> None:
+    task = None
     try:
         task = app.get(message.task)
         args: list[Any]
@@ -48,8 +49,11 @@ async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -
         result = task.fn(*args, **kwargs)
         if inspect.isawaitable(result):
             await result
-    except Exception:
-        writer.write(encode_failure(message.id, traceback.format_exc()))
+    except UnknownTaskError:
+        writer.write(encode_failure(message.id, traceback.format_exc(), retry=False))
+    except Exception as error:
+        retry = task.should_retry(error) if task is not None else False
+        writer.write(encode_failure(message.id, traceback.format_exc(), retry=retry))
     else:
         writer.write(encode_success(message.id))
     await writer.drain()

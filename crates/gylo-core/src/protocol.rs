@@ -10,13 +10,16 @@
 //!
 //! dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
 //! complete = 0x01 || i64 job_id || u8 outcome || error_utf8
+//!
+//! outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
 //! ```
 
 const HEADER_BYTES: usize = 4;
 const KIND_DISPATCH: u8 = 0x00;
 const KIND_COMPLETE: u8 = 0x01;
 const OUTCOME_SUCCESS: u8 = 0x00;
-const OUTCOME_FAILURE: u8 = 0x01;
+const OUTCOME_RETRY: u8 = 0x01;
+const OUTCOME_TERMINAL: u8 = 0x02;
 const COMPACT_THRESHOLD: usize = 1 << 16;
 
 /// Largest frame body accepted, guarding against a corrupt length prefix
@@ -26,7 +29,12 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Success,
-    Failure(String),
+    /// `retry` is decided by the child from the task's policy, since only it
+    /// can see the exception type.
+    Failure {
+        error: String,
+        retry: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +100,12 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
             out.extend_from_slice(&id.to_le_bytes());
             match outcome {
                 Outcome::Success => out.push(OUTCOME_SUCCESS),
-                Outcome::Failure(error) => {
-                    out.push(OUTCOME_FAILURE);
+                Outcome::Failure { error, retry } => {
+                    out.push(if *retry {
+                        OUTCOME_RETRY
+                    } else {
+                        OUTCOME_TERMINAL
+                    });
                     out.extend_from_slice(error.as_bytes());
                 }
             }
@@ -187,11 +199,12 @@ fn decode_body(body: &[u8]) -> Result<Message, ProtocolError> {
             let id = i64::from_le_bytes(rest[..8].try_into().expect("slice is 8 long"));
             let outcome = match rest[8] {
                 OUTCOME_SUCCESS => Outcome::Success,
-                OUTCOME_FAILURE => Outcome::Failure(
-                    std::str::from_utf8(&rest[9..])
+                code @ (OUTCOME_RETRY | OUTCOME_TERMINAL) => Outcome::Failure {
+                    error: std::str::from_utf8(&rest[9..])
                         .map_err(|_| ProtocolError::NotUtf8("error message"))?
                         .to_owned(),
-                ),
+                    retry: code == OUTCOME_RETRY,
+                },
                 other => return Err(ProtocolError::UnknownOutcome(other)),
             };
             Ok(Message::Complete { id, outcome })
@@ -237,12 +250,56 @@ mod tests {
     }
 
     #[test]
-    fn failure_round_trips() {
+    fn retryable_failure_round_trips() {
         let message = Message::Complete {
             id: 7,
-            outcome: Outcome::Failure("ValueError: café".to_owned()),
+            outcome: Outcome::Failure {
+                error: "ValueError: café".to_owned(),
+                retry: true,
+            },
         };
         assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn terminal_failure_round_trips() {
+        let message = Message::Complete {
+            id: 7,
+            outcome: Outcome::Failure {
+                error: "ValueError: nope".to_owned(),
+                retry: false,
+            },
+        };
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn retryable_and_terminal_use_distinct_codes() {
+        let mut retryable = Vec::new();
+        let mut terminal = Vec::new();
+        encode(
+            &Message::Complete {
+                id: 1,
+                outcome: Outcome::Failure {
+                    error: String::new(),
+                    retry: true,
+                },
+            },
+            &mut retryable,
+        )
+        .unwrap();
+        encode(
+            &Message::Complete {
+                id: 1,
+                outcome: Outcome::Failure {
+                    error: String::new(),
+                    retry: false,
+                },
+            },
+            &mut terminal,
+        )
+        .unwrap();
+        assert_ne!(retryable, terminal);
     }
 
     #[test]

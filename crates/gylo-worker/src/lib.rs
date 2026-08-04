@@ -62,6 +62,10 @@ pub struct Config {
     /// stay comfortably below `lease` or live jobs will be reclaimed.
     pub maintenance_interval: Duration,
     pub reclaim_limit: i64,
+    /// First retry lands after roughly this long, doubling per attempt.
+    pub retry_base: Duration,
+    /// Ceiling on the doubling, before jitter.
+    pub retry_cap: Duration,
     pub python: PathBuf,
     /// `module:attribute` path to the user's app object.
     pub app: String,
@@ -80,6 +84,8 @@ impl Default for Config {
             completion_linger: Duration::from_millis(5),
             maintenance_interval: Duration::from_secs(10),
             reclaim_limit: 1000,
+            retry_base: Duration::from_secs(1),
+            retry_cap: Duration::from_secs(3600),
             python: PathBuf::from("python3"),
             app: String::new(),
             python_path: None,
@@ -256,8 +262,7 @@ async fn session(
         reader,
         pool.clone(),
         Arc::clone(inflight),
-        config.completion_batch,
-        config.completion_linger,
+        config.clone(),
     ));
 
     let outcome = tokio::select! {
@@ -435,42 +440,66 @@ async fn dispatch(
 #[derive(Default)]
 struct Pending {
     completed: Vec<i64>,
-    failed: Vec<i64>,
-    errors: Vec<String>,
+    retry: Vec<i64>,
+    retry_errors: Vec<String>,
+    terminal: Vec<i64>,
+    terminal_errors: Vec<String>,
 }
 
 impl Pending {
     fn push(&mut self, id: i64, outcome: Outcome) {
         match outcome {
             Outcome::Success => self.completed.push(id),
-            Outcome::Failure(error) => {
-                self.failed.push(id);
-                self.errors.push(error);
+            Outcome::Failure { error, retry: true } => {
+                self.retry.push(id);
+                self.retry_errors.push(error);
+            }
+            Outcome::Failure {
+                error,
+                retry: false,
+            } => {
+                self.terminal.push(id);
+                self.terminal_errors.push(error);
             }
         }
     }
 
     fn len(&self) -> usize {
-        self.completed.len() + self.failed.len()
+        self.completed.len() + self.retry.len() + self.terminal.len()
     }
 
-    async fn flush(&mut self, pool: &PgPool, inflight: &InFlight) {
+    async fn flush(&mut self, pool: &PgPool, inflight: &InFlight, config: &Config) {
         if self.len() == 0 {
             return;
         }
         if let Err(error) = gylo_pg::complete_many(pool, &self.completed).await {
             tracing::error!(%error, jobs = self.completed.len(), "recording completions failed");
         }
-        if let Err(error) = gylo_pg::discard_many(pool, &self.failed, &self.errors).await {
-            tracing::error!(%error, jobs = self.failed.len(), "recording failures failed");
+        if let Err(error) = gylo_pg::retry_many(
+            pool,
+            &self.retry,
+            &self.retry_errors,
+            config.retry_base,
+            config.retry_cap,
+        )
+        .await
+        {
+            tracing::error!(%error, jobs = self.retry.len(), "scheduling retries failed");
+        }
+        if let Err(error) = gylo_pg::discard_many(pool, &self.terminal, &self.terminal_errors).await
+        {
+            tracing::error!(%error, jobs = self.terminal.len(), "recording failures failed");
         }
 
         let mut settled = Vec::with_capacity(self.len());
         settled.extend_from_slice(&self.completed);
-        settled.extend_from_slice(&self.failed);
+        settled.extend_from_slice(&self.retry);
+        settled.extend_from_slice(&self.terminal);
         self.completed.clear();
-        self.failed.clear();
-        self.errors.clear();
+        self.retry.clear();
+        self.retry_errors.clear();
+        self.terminal.clear();
+        self.terminal_errors.clear();
         inflight.release(&settled);
     }
 }
@@ -481,9 +510,10 @@ async fn collect_completions(
     mut reader: OwnedReadHalf,
     pool: PgPool,
     inflight: Arc<InFlight>,
-    batch: usize,
-    linger: Duration,
+    config: Config,
 ) {
+    let batch = config.completion_batch;
+    let linger = config.completion_linger;
     let mut decoder = Decoder::new();
     let mut chunk = vec![0u8; READ_BUFFER];
     let mut pending = Pending::default();
@@ -522,25 +552,25 @@ async fn collect_completions(
                         }
                         Err(error) => {
                             tracing::error!(%error, "python child sent an unreadable frame");
-                            pending.flush(&pool, &inflight).await;
+                            pending.flush(&pool, &inflight, &config).await;
                             return;
                         }
                     }
                 }
 
                 if pending.len() >= batch {
-                    pending.flush(&pool, &inflight).await;
+                    pending.flush(&pool, &inflight, &config).await;
                     deadline = None;
                 }
             }
             () = timer => {
-                pending.flush(&pool, &inflight).await;
+                pending.flush(&pool, &inflight, &config).await;
                 deadline = None;
             }
         }
     }
 
-    pending.flush(&pool, &inflight).await;
+    pending.flush(&pool, &inflight, &config).await;
 }
 
 fn spawn_child(config: &Config, socket: &Path) -> std::io::Result<Child> {

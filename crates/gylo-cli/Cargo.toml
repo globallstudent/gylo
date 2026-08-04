@@ -1,0 +1,21 @@
+[package]
+name = "gylo-cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "gylo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive", "env"] }
+dotenvy = "0.15.7"
+gylo-pg = { version = "0.1.0", path = "../gylo-pg" }
+gylo-worker = { version = "0.1.0", path = "../gylo-worker" }
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

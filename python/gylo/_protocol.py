@@ -7,6 +7,8 @@ Mirrors `crates/gylo-core/src/protocol.rs`; the two must change together.
 
     dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
     complete = 0x01 || i64 job_id || u8 outcome || error_utf8
+
+    outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
 """
 
 from __future__ import annotations
@@ -18,7 +20,8 @@ HEADER_BYTES = 4
 KIND_DISPATCH = 0x00
 KIND_COMPLETE = 0x01
 OUTCOME_SUCCESS = 0x00
-OUTCOME_FAILURE = 0x01
+OUTCOME_RETRY = 0x01
+OUTCOME_TERMINAL = 0x02
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 _LENGTH = struct.Struct("<I")
@@ -42,14 +45,14 @@ def encode_success(job_id: int) -> bytes:
     return _COMPLETE.pack(_COMPLETE_BODY_BYTES, KIND_COMPLETE, job_id, OUTCOME_SUCCESS)
 
 
-def encode_failure(job_id: int, error: str) -> bytes:
+def encode_failure(job_id: int, error: str, *, retry: bool) -> bytes:
     rendered = error.encode("utf-8", "replace")
     return (
         _COMPLETE.pack(
             _COMPLETE_BODY_BYTES + len(rendered),
             KIND_COMPLETE,
             job_id,
-            OUTCOME_FAILURE,
+            OUTCOME_RETRY if retry else OUTCOME_TERMINAL,
         )
         + rendered
     )

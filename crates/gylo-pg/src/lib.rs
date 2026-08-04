@@ -202,6 +202,87 @@ pub async fn renew_leases<'e, E: PgExecutor<'e>>(
     Ok(result.rows_affected())
 }
 
+const RETRY_MANY: &str = "
+    WITH input AS (
+        SELECT * FROM unnest($1::bigint[], $2::text[]) AS t(id, error)
+    ),
+    scheduled AS (
+        UPDATE gylo_job j
+        SET state = 'available',
+            locked_by = NULL,
+            lease_expires_at = NULL,
+            scheduled_at = now() + make_interval(secs =>
+                least($3::float8 * power(2, j.attempt - 1), $4::float8)
+                * (0.5 + random() * 0.5)
+            ),
+            errors = j.errors || jsonb_build_object(
+                'attempt', j.attempt,
+                'at', now(),
+                'error', i.error
+            )
+        FROM input i
+        WHERE j.id = i.id AND j.state = 'running' AND j.attempt < j.max_attempts
+        RETURNING j.id
+    ),
+    exhausted AS (
+        UPDATE gylo_job j
+        SET state = 'discarded',
+            finalized_at = now(),
+            locked_by = NULL,
+            lease_expires_at = NULL,
+            errors = j.errors || jsonb_build_object(
+                'attempt', j.attempt,
+                'at', now(),
+                'error', i.error
+            )
+        FROM input i
+        WHERE j.id = i.id AND j.state = 'running' AND j.attempt >= j.max_attempts
+        RETURNING j.id
+    )
+    SELECT
+        (SELECT count(*) FROM scheduled)  AS scheduled,
+        (SELECT count(*) FROM exhausted)  AS exhausted
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Retried {
+    /// Scheduled for another attempt.
+    pub scheduled: i64,
+    /// Out of attempts, so dead-lettered instead.
+    pub exhausted: i64,
+}
+
+/// Reschedules failed jobs with exponential backoff, dead-lettering those out
+/// of attempts.
+///
+/// The delay is computed per row from the job's own `attempt`, so the caller
+/// never has to carry attempt counts alongside its completion batch. Jitter is
+/// applied at 50–100% of nominal, which keeps a burst of simultaneous failures
+/// from retrying in lockstep.
+pub async fn retry_many<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    errors: &[String],
+    base: Duration,
+    cap: Duration,
+) -> Result<Retried, Error> {
+    debug_assert_eq!(ids.len(), errors.len());
+    if ids.is_empty() {
+        return Ok(Retried::default());
+    }
+    let row = sqlx::query(RETRY_MANY)
+        .bind(ids)
+        .bind(errors)
+        .bind(base.as_secs_f64())
+        .bind(cap.as_secs_f64())
+        .fetch_one(executor)
+        .await?;
+    Ok(Retried {
+        scheduled: row.try_get("scheduled")?,
+        exhausted: row.try_get("exhausted")?,
+    })
+}
+
 const ABANDON: &str = "
     UPDATE gylo_job
     SET lease_expires_at = now() - interval '1 microsecond'
