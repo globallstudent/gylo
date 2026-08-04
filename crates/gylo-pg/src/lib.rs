@@ -101,6 +101,20 @@ const ENQUEUE: &str = "
     RETURNING id
 ";
 
+/// Serialises admission so a key's limit means what it says.
+///
+/// Counting a key's running jobs and then admitting against that count is a
+/// read followed by an act, and two overlapping fetches both read zero and both
+/// admit. `SKIP LOCKED` does not help: it stops two workers taking the same
+/// row, and this is two workers taking different rows for the same key.
+///
+/// Taken as its own statement before the fetch rather than inside it. Postgres
+/// inlines and reorders CTEs, so a lock written as one is not ordered against
+/// the count that has to follow it: expressed that way the limit was exceeded
+/// by four rather than two. Released when the transaction commits, which is
+/// after the rows are marked running and so become countable.
+const ADMISSION_LOCK: i64 = 0x6779_6c6f_0001;
+
 const FETCH: &str = "
     WITH active AS (
         SELECT concurrency_key, count(*) AS running
@@ -515,20 +529,26 @@ pub async fn enqueue<'e, E: PgExecutor<'e>>(executor: E, job: &NewJob) -> Result
 /// Ordering is global rather than per queue, so a job's priority means the same
 /// thing wherever it was placed. Round-robin between queues would make a high
 /// priority in a quiet queue lose to a low one in a busy neighbour.
-pub async fn fetch<'e, E: PgExecutor<'e>>(
-    executor: E,
+pub async fn fetch(
+    pool: &PgPool,
     queues: &[String],
     limit: i64,
     lease: Duration,
     worker: Uuid,
 ) -> Result<Vec<Job>, Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ADMISSION_LOCK)
+        .execute(&mut *tx)
+        .await?;
     let rows = sqlx::query(FETCH)
         .bind(queues)
         .bind(limit)
         .bind(worker)
         .bind(lease.as_secs_f64())
-        .fetch_all(executor)
+        .fetch_all(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     rows.into_iter()
         .map(|row| {

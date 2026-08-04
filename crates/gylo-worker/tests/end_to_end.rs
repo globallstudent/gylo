@@ -928,11 +928,6 @@ async fn two_workers_on_one_queue_run_each_job_exactly_once(pool: PgPool) {
     );
 }
 
-// Two overlapping fetches both read zero running for a key and each admits one.
-// Kept and ignored rather than deleted: the fix is a design decision with a
-// throughput cost, and this reproduction is the evidence for it. `--ignored`
-// runs them.
-#[ignore = "known: keyed concurrency admits over its limit when fetches overlap"]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_key_limits_concurrency_across_workers_not_just_within_one(pool: PgPool) {
     let log = effects_log();
@@ -980,9 +975,6 @@ async fn a_key_limits_concurrency_across_workers_not_just_within_one(pool: PgPoo
     );
 }
 
-// Fails 7 runs in 10, worse than the two-worker case: this is one worker at its
-// default shape, one child per core.
-#[ignore = "known: keyed concurrency admits over its limit when fetches overlap"]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_key_limits_concurrency_within_one_worker(pool: PgPool) {
     let log = effects_log();

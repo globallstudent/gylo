@@ -115,18 +115,15 @@ async fn concurrent_fetches_never_hand_out_the_same_job(pool: PgPool) {
         enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     }
 
-    let mut first = pool.begin().await.unwrap();
-    let mut second = pool.begin().await.unwrap();
-
-    let claimed_first = fetch(&mut *first, &queues("default"), 10, LEASE, worker())
-        .await
-        .unwrap();
-    let claimed_second = fetch(&mut *second, &queues("default"), 10, LEASE, worker())
-        .await
-        .unwrap();
-
-    first.commit().await.unwrap();
-    second.commit().await.unwrap();
+    // genuinely at the same time, through the pool, because that is how two
+    // workers reach this and the path now owns its own transaction
+    let names = queues("default");
+    let (claimed_first, claimed_second) = tokio::join!(
+        fetch(&pool, &names, 10, LEASE, worker()),
+        fetch(&pool, &names, 10, LEASE, worker()),
+    );
+    let claimed_first = claimed_first.unwrap();
+    let claimed_second = claimed_second.unwrap();
 
     assert_eq!(claimed_first.len(), 10);
     assert_eq!(claimed_second.len(), 10);
@@ -694,16 +691,12 @@ async fn concurrent_workers_respect_the_same_key(pool: PgPool) {
         .unwrap();
     }
 
-    let mut first = pool.begin().await.unwrap();
-    let mut second = pool.begin().await.unwrap();
-    let a = fetch(&mut *first, &queues("default"), 20, LEASE, worker())
-        .await
-        .unwrap();
-    let b = fetch(&mut *second, &queues("default"), 20, LEASE, worker())
-        .await
-        .unwrap();
-    first.commit().await.unwrap();
-    second.commit().await.unwrap();
+    let names = queues("default");
+    let (a, b) = tokio::join!(
+        fetch(&pool, &names, 20, LEASE, worker()),
+        fetch(&pool, &names, 20, LEASE, worker()),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
 
     assert!(
         a.len() + b.len() <= 3,
