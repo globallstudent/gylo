@@ -44,6 +44,8 @@ pub enum Error {
     ChildExited(String),
     #[error("invalid configuration: {0}")]
     Config(String),
+    #[error(transparent)]
+    Unsupported(#[from] gylo_core::Unsupported),
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +86,9 @@ pub struct Config {
     pub python_path: Option<OsString>,
     /// Extra environment for the child, on top of what the worker inherited.
     pub env: Vec<(OsString, OsString)>,
+    /// Features this deployment uses. A backend that cannot provide one of
+    /// them stops the worker at startup rather than quietly doing less.
+    pub requires: Vec<gylo_core::Feature>,
 }
 
 impl Default for Config {
@@ -106,6 +111,7 @@ impl Default for Config {
             app: String::new(),
             python_path: None,
             env: Vec::new(),
+            requires: Vec::new(),
         }
     }
 }
@@ -227,6 +233,7 @@ impl InFlight {
 /// attempt. Surviving that is the reason task code runs in its own process.
 pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> Result<(), Error> {
     config.validate()?;
+    gylo_pg::CAPABILITIES.require(&config.requires)?;
 
     let worker = Uuid::new_v4();
     let inflight = Arc::new(InFlight::new(config.concurrency));

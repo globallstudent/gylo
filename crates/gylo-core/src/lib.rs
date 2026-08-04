@@ -1,9 +1,11 @@
 //! Types shared between the gylo supervisor, the Postgres backend, and the
 //! Python worker protocol.
 
+mod capability;
 mod protocol;
 mod schedule;
 
+pub use capability::{Capabilities, Feature, Unsupported};
 pub use protocol::{
     CronRegistration, Decoder, MAX_FRAME_BYTES, Message, Outcome, ProtocolError, encode,
 };

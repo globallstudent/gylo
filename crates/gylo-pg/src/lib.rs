@@ -17,6 +17,21 @@ use uuid::Uuid;
 /// before the row it is being told about is visible.
 pub const AVAILABLE_CHANNEL: &str = "gylo_available";
 
+/// Everything gylo does, since Postgres is where every feature was designed.
+pub const CAPABILITIES: gylo_core::Capabilities = gylo_core::Capabilities {
+    backend: "postgres",
+    durable_acknowledgement: true,
+    transactional_enqueue: true,
+    priorities: true,
+    delayed_jobs: true,
+    unique_jobs: true,
+    keyed_concurrency: true,
+    workflows: true,
+    durable_steps: true,
+    cron: true,
+    results: true,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]

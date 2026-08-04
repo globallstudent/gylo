@@ -747,3 +747,22 @@ async fn a_batch_of_jobs_all_complete(pool: PgPool) {
         .get(0);
     assert_eq!(completed, 250);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn required_features_are_checked_before_anything_starts(pool: PgPool) {
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let config = Config {
+        requires: vec![
+            gylo_core::Feature::Workflows,
+            gylo_core::Feature::DurableSteps,
+            gylo_core::Feature::TransactionalEnqueue,
+        ],
+        ..config()
+    };
+
+    run(pool, config, shutdown)
+        .await
+        .expect("postgres provides everything gylo asks of it");
+}
