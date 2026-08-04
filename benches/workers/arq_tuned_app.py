@@ -6,13 +6,13 @@ from shared import adone
 
 
 async def work(ctx, n: int) -> None:
-    await adone()
+    await adone(n)
 
 
 class WorkerSettings:
     functions: ClassVar = [work]
     redis_settings = RedisSettings.from_dsn(
-        os.environ.setdefault("GYLO_BENCH_REDIS", "redis://127.0.0.1:6389/0")
+        os.environ.setdefault("GYLO_BENCH_REDIS", "redis://127.0.0.1:6389/9")
     )
     keep_result = 0
     poll_delay = 0.01

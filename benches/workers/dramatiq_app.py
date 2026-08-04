@@ -13,4 +13,4 @@ dramatiq.set_broker(
 
 @dramatiq.actor(queue_name="bench", max_retries=0)
 def work(n: int) -> None:
-    done()
+    done(n)

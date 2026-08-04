@@ -7,4 +7,4 @@ app = gylo.Gylo()
 
 @app.task(name="bench.work")
 async def work(n: int) -> None:
-    await adone()
+    await adone(n)

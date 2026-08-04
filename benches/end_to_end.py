@@ -9,7 +9,7 @@ from pathlib import Path
 
 WORKERS = Path(__file__).parent / "workers"
 ROOT = Path(__file__).resolve().parents[1]
-REDIS = os.environ.get("GYLO_BENCH_REDIS", "redis://127.0.0.1:6389/0")
+REDIS = os.environ.get("GYLO_BENCH_REDIS", "redis://127.0.0.1:6389/9")
 DSN = os.environ.get("DATABASE_URL", "postgres://gylo:gylo@127.0.0.1:5442/gylo_dev")
 JOBS = int(os.environ.get("JOBS", "20000"))
 REPEATS = int(os.environ.get("REPEATS", "3"))
@@ -19,6 +19,14 @@ OPENS, CLOSES = int(JOBS * 0.2), int(JOBS * 0.8)
 sys.path.insert(0, str(WORKERS))
 sys.path.insert(0, str(ROOT / "python"))
 import shared  # noqa: E402
+
+
+def progress(line: str) -> None:
+    """A slow library can take minutes per round, and a benchmark that prints
+    nothing until it finishes is indistinguishable from one that has hung.
+    Skipped when redirected, where a carriage return is just a character."""
+    if sys.stdout.isatty():
+        print(line.ljust(46), end="\r", flush=True)
 
 
 def environment() -> dict[str, str]:
@@ -192,19 +200,18 @@ def main() -> None:
         try:
             results = []
             for round_ in range(REPEATS):
-                # a slow library can take minutes per round, and a benchmark
-                # that prints nothing until it finishes is indistinguishable
-                # from one that has hung
-                print(f"{name:<10} {f'run {round_ + 1}/{REPEATS}':>12}", end="\r")
+                progress(f"{name:<10} run {round_ + 1}/{REPEATS}")
                 shared.reset()
                 seed()
                 result = drain(command())
                 if result is not None:
                     results.append(result)
             if not results:
+                progress("")
                 print(f"{name:<10} {'incomplete':>12}")
                 continue
             rate, startup = max(results, key=lambda pair: pair[0])
+            progress("")
             print(
                 f"{name:<10} {rate:>10,.0f}/s  {JOBS / rate:>8.2f}s  "
                 f"{startup * 1000:>7.0f}ms"

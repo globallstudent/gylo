@@ -12,4 +12,4 @@ app.conf.task_ignore_result = True
 
 @app.task(name="bench.work")
 def work(n: int) -> None:
-    done()
+    done(n)
