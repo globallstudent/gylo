@@ -57,6 +57,9 @@ jobs:
   publish:
     needs: [wheels, sdist]
     runs-on: ubuntu-latest
+    # only a tag publishes, so a manual run is a safe way to prove the wheels
+    # build without spending a version number that can never be reused
+    if: startsWith(github.ref, 'refs/tags/')
     environment: pypi
     permissions:
       # what Trusted Publishing exchanges for a short-lived token, so no API
