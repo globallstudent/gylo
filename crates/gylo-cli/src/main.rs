@@ -58,9 +58,10 @@ enum Command {
         #[arg(long, default_value = "10s")]
         maintenance_interval: humantime::Duration,
 
-        /// Interpreter to run task code with.
-        #[arg(long, default_value = "python3", env = "GYLO_PYTHON")]
-        python: PathBuf,
+        /// Interpreter to run task code with. Defaults to the one beside this
+        /// executable, falling back to `python3` on PATH.
+        #[arg(long, env = "GYLO_PYTHON")]
+        python: Option<PathBuf>,
 
         /// Value for the child's PYTHONPATH.
         #[arg(long, env = "PYTHONPATH")]
@@ -70,6 +71,26 @@ enum Command {
         #[arg(long)]
         pool_size: Option<u32>,
     },
+}
+
+/// The interpreter that owns this installation.
+///
+/// A wheel puts the `gylo` binary in the same directory as the environment's
+/// own interpreter, which is the one that can import the user's tasks. Taking
+/// `python3` off PATH instead picks up whichever interpreter happens to come
+/// first, so an activated environment or a system Python shadowing the venv
+/// silently runs task code somewhere the dependencies are not installed.
+fn sibling_python() -> PathBuf {
+    let name = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python3"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|bin| bin.join(name)))
+        .filter(|python| python.is_file())
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 async fn connect(url: Option<String>, size: u32) -> Result<PgPool> {
@@ -126,7 +147,7 @@ async fn main() -> Result<()> {
                 lease: lease.into(),
                 poll_interval: poll_interval.into(),
                 maintenance_interval: maintenance_interval.into(),
-                python,
+                python: python.unwrap_or_else(sibling_python),
                 app,
                 python_path,
                 ..Config::default()
