@@ -39,6 +39,9 @@ jobs:
 
     env:
       DATABASE_URL: postgres://gylo:gylo@127.0.0.1:5432/gylo_test
+      # deliberately its own variable: the Python fixtures truncate, and
+      # pointing them at DATABASE_URL would wipe a developer's dev database
+      GYLO_TEST_DATABASE_URL: postgres://gylo:gylo@127.0.0.1:5432/gylo_test
       GYLO_REDIS_URL: redis://127.0.0.1:6379/1
 
     steps:
@@ -67,5 +70,9 @@ jobs:
       - run: .venv/bin/ruff format --check python benches crates/gylo-worker/tests/fixtures
 
       - run: .venv/bin/ruff check python benches crates/gylo-worker/tests/fixtures
+
+      # cargo test provisions its own databases; the Python suite works
+      # against this one and needs the schema put there first
+      - run: cargo run -p gylo-cli -- migrate
 
       - run: PYTHONPATH=python .venv/bin/python -m pytest python -q
