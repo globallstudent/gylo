@@ -7,15 +7,19 @@ others talk to Redis because that is what they are. That difference is real
 and is part of the choice, but it means a slower number here is not on its
 own evidence of a slower library.
 
-Two figures are reported for gylo. The transactional one is the feature: the
-job commits with your business write. The pipelined one is what to compare
-against a fire-and-forget `delay()`, which is what the others are doing.
+Three figures are reported for gylo. The marginal one is the honest
+comparison for the transactional path: a caller enqueueing inside a
+transaction they already have, since that is the situation the feature exists
+for, and the added latency is what a competitor's `delay()` is also adding.
+Giving the enqueue a transaction of its own charges it for a BEGIN and COMMIT
+the caller already pays, which flatters nobody and describes no real use.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import statistics
 import time
 from collections.abc import Callable
 
@@ -45,18 +49,48 @@ async def bench_gylo_transactional() -> None:
 
     conn = await asyncpg.connect(DSN)
     await conn.execute("TRUNCATE gylo_job CASCADE")
-    for _ in range(50):
-        await charge.enqueue(conn, *ARGS, **KWARGS)
-
-    start = time.perf_counter()
-    for _ in range(ROUNDS):
-        async with conn.transaction():
-            await charge.enqueue(conn, *ARGS, **KWARGS)
-    report(
-        "gylo (in a transaction)",
-        "commits with your write",
-        time.perf_counter() - start,
+    await conn.execute("DROP TABLE IF EXISTS bench_order")
+    await conn.execute(
+        "CREATE TABLE bench_order (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        " total int NOT NULL)"
     )
+
+    async def business_only() -> None:
+        async with conn.transaction():
+            await conn.fetchval(
+                "INSERT INTO bench_order (total) VALUES ($1) RETURNING id", 1999
+            )
+
+    async def business_and_job() -> None:
+        async with conn.transaction():
+            await conn.fetchval(
+                "INSERT INTO bench_order (total) VALUES ($1) RETURNING id", 1999
+            )
+            await charge.enqueue(conn, *ARGS, **KWARGS)
+
+    for _ in range(50):
+        await business_only()
+        await business_and_job()
+
+    # medians of per-operation samples, not a difference of two totals: a
+    # subtraction of totals compounds the noise in both and produced swings of
+    # more than 2x between runs
+    async def samples(run) -> list[float]:
+        taken = []
+        for _ in range(ROUNDS):
+            start = time.perf_counter()
+            await run()
+            taken.append(time.perf_counter() - start)
+        return taken
+
+    baseline = statistics.median(await samples(business_only))
+    together = statistics.median(await samples(business_and_job))
+    marginal = max(together - baseline, 1e-9)
+    print(
+        f"{'gylo (transactional)':<26} {1 / marginal:>10,.0f}/s  "
+        f"{marginal * 1e6:>9.1f}µs   added to a transaction you already had"
+    )
+    await conn.execute("DROP TABLE bench_order")
 
     await conn.execute("TRUNCATE gylo_job CASCADE")
     start = time.perf_counter()
