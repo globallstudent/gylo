@@ -280,3 +280,28 @@ async def test_cancelling_a_running_job_leaves_it_alone(conn):
 
 async def test_cancelling_nothing_is_a_no_op(conn):
     assert await gylo.cancel(conn) == 0
+
+
+async def test_a_concurrency_key_reaches_the_row(conn):
+    job_id = await compute.options(
+        concurrency_key="tenant-42", max_concurrency=3
+    ).enqueue(conn, 1, 1)
+
+    record = await row(conn, job_id)
+    assert record["concurrency_key"] == "tenant-42"
+    assert record["max_concurrency"] == 3
+
+
+async def test_a_key_without_a_limit_is_rejected(conn):
+    with pytest.raises(ValueError, match="together"):
+        compute.options(concurrency_key="tenant-42")
+
+
+async def test_a_limit_without_a_key_is_rejected(conn):
+    with pytest.raises(ValueError, match="together"):
+        compute.options(max_concurrency=3)
+
+
+async def test_a_limit_below_one_is_rejected(conn):
+    with pytest.raises(ValueError, match="at least 1"):
+        compute.options(concurrency_key="t", max_concurrency=0)

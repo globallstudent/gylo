@@ -14,7 +14,10 @@ import msgspec
 
 __all__ = ["UnsupportedDriverError", "adapter_for"]
 
-_COLUMNS = "queue, task, payload, priority, max_attempts, scheduled_at"
+_COLUMNS = (
+    "queue, task, payload, priority, max_attempts, scheduled_at, "
+    "concurrency_key, max_concurrency"
+)
 _UNIQUE_PREDICATE = "unique_key IS NOT NULL AND state IN ('available', 'running')"
 
 
@@ -50,21 +53,21 @@ class Adapter(Protocol):
 class AsyncpgAdapter:
     INSERT = (
         f"INSERT INTO gylo_job ({_COLUMNS}) "
-        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6)) "
+        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8) "
         "RETURNING id"
     )
     INSERT_UNIQUE = (
         f"WITH new AS (INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7) "
+        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9) "
         f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING "
         "RETURNING id) "
         "SELECT id FROM new UNION ALL "
         "SELECT id FROM gylo_job "
-        "WHERE unique_key = $7 AND state IN ('available', 'running') LIMIT 1"
+        "WHERE unique_key = $9 AND state IN ('available', 'running') LIMIT 1"
     )
     INSERT_MANY_UNIQUE = (
         f"INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7) "
+        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9) "
         f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING"
     )
 
@@ -100,12 +103,12 @@ class AsyncpgAdapter:
 class PsycopgAdapter:
     INSERT = (
         f"INSERT INTO gylo_job ({_COLUMNS}) "
-        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s)) "
+        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s, %s) "
         "RETURNING id"
     )
     INSERT_UNIQUE = (
         f"WITH new AS (INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s) "
+        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s, %s, %s) "
         f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING "
         "RETURNING id) "
         "SELECT id FROM new UNION ALL "
@@ -114,7 +117,7 @@ class PsycopgAdapter:
     )
     INSERT_MANY_UNIQUE = (
         f"INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s) "
+        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s, %s, %s) "
         f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING"
     )
 

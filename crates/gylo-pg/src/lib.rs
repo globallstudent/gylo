@@ -34,6 +34,8 @@ pub struct NewJob {
     pub priority: i16,
     pub max_attempts: i16,
     pub delay: Duration,
+    /// Set together: at most `max_concurrency` jobs sharing this key run at once.
+    pub concurrency: Option<(String, i32)>,
 }
 
 impl NewJob {
@@ -45,6 +47,7 @@ impl NewJob {
             priority: 0,
             max_attempts: 20,
             delay: Duration::ZERO,
+            concurrency: None,
         }
     }
 
@@ -65,21 +68,47 @@ impl NewJob {
         self.priority = priority;
         self
     }
+
+    #[must_use]
+    pub fn limited_to(mut self, key: impl Into<String>, at_once: i32) -> Self {
+        self.concurrency = Some((key.into(), at_once));
+        self
+    }
 }
 
 const ENQUEUE: &str = "
-    INSERT INTO gylo_job (queue, task, payload, priority, max_attempts, scheduled_at)
-    VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))
+    INSERT INTO gylo_job (queue, task, payload, priority, max_attempts, scheduled_at,
+                          concurrency_key, max_concurrency)
+    VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8)
     RETURNING id
 ";
 
 const FETCH: &str = "
-    WITH candidate AS (
-        SELECT id FROM gylo_job
-        WHERE state = 'available' AND queue = $1 AND scheduled_at <= now()
-        ORDER BY priority, scheduled_at, id
+    WITH active AS (
+        SELECT concurrency_key, count(*) AS running
+        FROM gylo_job
+        WHERE state = 'running' AND concurrency_key IS NOT NULL
+        GROUP BY concurrency_key
+    ),
+    locked AS (
+        SELECT j.id, j.priority, j.scheduled_at, j.concurrency_key, j.max_concurrency,
+               COALESCE(a.running, 0) AS already
+        FROM gylo_job j
+        LEFT JOIN active a ON a.concurrency_key = j.concurrency_key
+        WHERE j.state = 'available' AND j.queue = $1 AND j.scheduled_at <= now()
+          AND (j.concurrency_key IS NULL OR COALESCE(a.running, 0) < j.max_concurrency)
+        ORDER BY j.priority, j.scheduled_at, j.id
         LIMIT $2
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF j SKIP LOCKED
+    ),
+    admitted AS (
+        SELECT id FROM (
+            SELECT id, concurrency_key, max_concurrency, already,
+                   row_number() OVER (PARTITION BY concurrency_key
+                                      ORDER BY priority, scheduled_at, id) AS n
+            FROM locked
+        ) ranked
+        WHERE concurrency_key IS NULL OR already + n <= max_concurrency
     )
     UPDATE gylo_job j
     SET state = 'running',
@@ -87,7 +116,7 @@ const FETCH: &str = "
         lease_expires_at = now() + make_interval(secs => $4),
         started_at = now(),
         attempt = j.attempt + 1
-    FROM candidate c
+    FROM admitted c
     WHERE j.id = c.id
     RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts
 ";
@@ -374,12 +403,20 @@ pub async fn enqueue<'e, E: PgExecutor<'e>>(executor: E, job: &NewJob) -> Result
         .bind(job.priority)
         .bind(job.max_attempts)
         .bind(job.delay.as_secs_f64())
+        .bind(job.concurrency.as_ref().map(|(key, _)| key.as_str()))
+        .bind(job.concurrency.as_ref().map(|(_, at_once)| *at_once))
         .fetch_one(executor)
         .await?;
     Ok(row.try_get("id")?)
 }
 
 /// Leases up to `limit` eligible jobs, skipping rows another worker holds.
+///
+/// A job carrying a concurrency key is admitted only while fewer than
+/// `max_concurrency` of that key are running. The count is taken before
+/// locking and the batch is then ranked per key, because Postgres will not
+/// accept `FOR UPDATE` beside a window function — so the limit has to be
+/// applied in two passes rather than one.
 pub async fn fetch<'e, E: PgExecutor<'e>>(
     executor: E,
     queue: &str,

@@ -88,6 +88,8 @@ class Task:
         delay: float | None = None,
         max_attempts: int | None = None,
         unique: bool | str | None = None,
+        concurrency_key: str | None = None,
+        max_concurrency: int | None = None,
     ) -> BoundTask:
         """Bind enqueue options for the next call.
 
@@ -98,13 +100,25 @@ class Task:
         `unique=True` deduplicates on the arguments; `unique="key"` on a key
         you choose. Either way a job already waiting or running blocks a second
         one, and enqueue returns the id of the job that is already there.
+
+        `concurrency_key` with `max_concurrency` caps how many jobs sharing
+        that key run at once, which is how one tenant is stopped from starving
+        the others.
         """
+        if (concurrency_key is None) != (max_concurrency is None):
+            raise ValueError(
+                "concurrency_key and max_concurrency must be given together"
+            )
+        if max_concurrency is not None and max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least 1")
         given = {
             "queue": queue,
             "priority": priority,
             "delay": delay,
             "max_attempts": max_attempts,
             "unique": unique,
+            "concurrency_key": concurrency_key,
+            "max_concurrency": max_concurrency,
         }
         return BoundTask(
             self, Options(**{k: v for k, v in given.items() if v is not None})
@@ -156,6 +170,8 @@ class Options:
     delay: float = 0.0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     unique: bool | str = False
+    concurrency_key: str | None = None
+    max_concurrency: int | None = None
 
 
 def _unique_key(
@@ -195,6 +211,8 @@ class BoundTask:
             self.options.priority,
             self.options.max_attempts,
             float(self.options.delay),
+            self.options.concurrency_key,
+            self.options.max_concurrency,
         )
         if self.options.unique is False:
             return row

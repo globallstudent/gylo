@@ -539,3 +539,127 @@ async fn one_worker_cannot_expire_or_extend_a_lease_another_holds(pool: PgPool) 
         1
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_key_admits_only_its_limit(pool: PgPool) {
+    for _ in 0..10 {
+        enqueue(
+            &pool,
+            &NewJob::new("t", Vec::new()).limited_to("tenant-a", 2),
+        )
+        .await
+        .unwrap();
+    }
+
+    let jobs = fetch(&pool, "default", 100, LEASE, worker()).await.unwrap();
+
+    assert_eq!(
+        jobs.len(),
+        2,
+        "a single batch must not exceed the limit either"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn keys_are_limited_independently(pool: PgPool) {
+    for tenant in ["a", "b", "c"] {
+        for _ in 0..5 {
+            enqueue(
+                &pool,
+                &NewJob::new("t", Vec::new()).limited_to(format!("tenant-{tenant}"), 2),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let jobs = fetch(&pool, "default", 100, LEASE, worker()).await.unwrap();
+
+    assert_eq!(jobs.len(), 6, "two each from three keys");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn unkeyed_jobs_are_never_held_back(pool: PgPool) {
+    for _ in 0..5 {
+        enqueue(
+            &pool,
+            &NewJob::new("t", Vec::new()).limited_to("tenant-a", 1),
+        )
+        .await
+        .unwrap();
+    }
+    for _ in 0..5 {
+        enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    }
+
+    let jobs = fetch(&pool, "default", 100, LEASE, worker()).await.unwrap();
+
+    assert_eq!(
+        jobs.len(),
+        6,
+        "one from the limited key, plus all five free"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_finished_job_frees_its_slot(pool: PgPool) {
+    let me = worker();
+    for _ in 0..3 {
+        enqueue(
+            &pool,
+            &NewJob::new("t", Vec::new()).limited_to("tenant-a", 1),
+        )
+        .await
+        .unwrap();
+    }
+
+    let first = fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(
+        fetch(&pool, "default", 10, LEASE, worker())
+            .await
+            .unwrap()
+            .is_empty(),
+        "the slot is taken while the first job runs"
+    );
+
+    complete_many(&pool, &[first[0].id], me).await.unwrap();
+
+    assert_eq!(
+        fetch(&pool, "default", 10, LEASE, worker())
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "finishing one lets the next in"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_workers_respect_the_same_key(pool: PgPool) {
+    for _ in 0..20 {
+        enqueue(
+            &pool,
+            &NewJob::new("t", Vec::new()).limited_to("tenant-a", 3),
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut first = pool.begin().await.unwrap();
+    let mut second = pool.begin().await.unwrap();
+    let a = fetch(&mut *first, "default", 20, LEASE, worker())
+        .await
+        .unwrap();
+    let b = fetch(&mut *second, "default", 20, LEASE, worker())
+        .await
+        .unwrap();
+    first.commit().await.unwrap();
+    second.commit().await.unwrap();
+
+    assert!(
+        a.len() + b.len() <= 3,
+        "two workers claimed {} together, over the limit of 3",
+        a.len() + b.len()
+    );
+}
