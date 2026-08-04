@@ -25,7 +25,11 @@ jobs:
         # x86_64 runners are being retired and queue indefinitely.
         platform:
           - { runner: ubuntu-22.04, target: x86_64, manylinux: auto }
-          - { runner: ubuntu-22.04, target: aarch64, manylinux: auto }
+          # 2_28 rather than auto: the manylinux2014 aarch64 cross-compiler
+          # is old enough not to define __ARM_ARCH, which ring's assembly
+          # requires. Dropping TLS would avoid ring and also every managed
+          # Postgres, so the newer container is the cheaper concession.
+          - { runner: ubuntu-22.04, target: aarch64, manylinux: "2_28" }
           # full triples: given the short name the musl containers resolve the
           # gnu target and ring's C build fails against the wrong libc
           - { runner: ubuntu-22.04, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
