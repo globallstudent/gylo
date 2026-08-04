@@ -16,4 +16,6 @@ pub struct Job {
     pub payload: Vec<u8>,
     pub attempt: i16,
     pub max_attempts: i16,
+    /// Whether this job's completed steps are kept for replay on a retry.
+    pub durable: bool,
 }

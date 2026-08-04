@@ -4,6 +4,10 @@ Placeholder syntax is driver-specific, so each adapter owns its own SQL rather
 than a shared string being rewritten. The Rust core is not involved: it cannot
 join a transaction owned by a Python driver, which is the whole reason enqueue
 runs here.
+
+The statements are generated rather than written out. The column list has grown
+several times, and hand-numbering `$1` through `$10` twice per driver is a
+defect waiting to happen.
 """
 
 from __future__ import annotations
@@ -15,20 +19,56 @@ import msgspec
 __all__ = ["UnsupportedDriverError", "adapter_for"]
 
 _COLUMNS = (
-    "queue, task, payload, priority, max_attempts, scheduled_at, "
-    "concurrency_key, max_concurrency"
+    "queue",
+    "task",
+    "payload",
+    "priority",
+    "max_attempts",
+    "scheduled_at",
+    "concurrency_key",
+    "max_concurrency",
+    "durable",
 )
+_DELAY = _COLUMNS.index("scheduled_at")
 _UNIQUE_PREDICATE = "unique_key IS NOT NULL AND state IN ('available', 'running')"
+_LIVE = "state IN ('available', 'running')"
 
 
 class UnsupportedDriverError(TypeError):
     """No adapter recognises the given connection object."""
 
 
+def _statements(marks: list[str]) -> tuple[str, str, str, str, str]:
+    """Builds every statement a driver needs from its placeholder style."""
+    columns = ", ".join(_COLUMNS)
+    values = list(marks[: len(_COLUMNS)])
+    values[_DELAY] = f"now() + make_interval(secs => {values[_DELAY]})"
+    plain = ", ".join(values)
+    key_mark = marks[len(_COLUMNS)]
+    keyed = ", ".join([*values, key_mark])
+    tail = marks[len(_COLUMNS) + 1] if len(marks) > len(_COLUMNS) + 1 else key_mark
+
+    return (
+        f"INSERT INTO gylo_job ({columns}) VALUES ({plain}) RETURNING id",
+        f"WITH new AS (INSERT INTO gylo_job ({columns}, unique_key) VALUES ({keyed}) "
+        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING RETURNING id) "
+        f"SELECT id FROM new UNION ALL "
+        f"SELECT id FROM gylo_job WHERE unique_key = {tail} AND {_LIVE} LIMIT 1",
+        f"INSERT INTO gylo_job ({columns}, unique_key) VALUES ({keyed}) "
+        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING",
+        f"SELECT state::text, result, errors FROM gylo_job WHERE id = {marks[0]}",
+        "UPDATE gylo_job SET state = 'cancelled', finalized_at = now(), "
+        "locked_by = NULL, lease_expires_at = NULL "
+        f"WHERE id = ANY({marks[0]}) AND state = 'available'",
+    )
+
+
 class Adapter(Protocol):
     INSERT: str
     INSERT_UNIQUE: str
     INSERT_MANY_UNIQUE: str
+    OUTCOME: str
+    CANCEL: str
 
     @classmethod
     async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int: ...
@@ -51,24 +91,8 @@ class Adapter(Protocol):
 
 
 class AsyncpgAdapter:
-    INSERT = (
-        f"INSERT INTO gylo_job ({_COLUMNS}) "
-        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8) "
-        "RETURNING id"
-    )
-    INSERT_UNIQUE = (
-        f"WITH new AS (INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9) "
-        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING "
-        "RETURNING id) "
-        "SELECT id FROM new UNION ALL "
-        "SELECT id FROM gylo_job "
-        "WHERE unique_key = $9 AND state IN ('available', 'running') LIMIT 1"
-    )
-    INSERT_MANY_UNIQUE = (
-        f"INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9) "
-        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING"
+    INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
+        [f"${n}" for n in range(1, len(_COLUMNS) + 2)]
     )
 
     @classmethod
@@ -89,36 +113,20 @@ class AsyncpgAdapter:
     async def outcome(
         cls, conn: Any, job_id: int
     ) -> tuple[str, bytes | None, Any] | None:
-        row = await conn.fetchrow(_OUTCOME.format("$1"), job_id)
+        row = await conn.fetchrow(cls.OUTCOME, job_id)
         if row is None:
             return None
         return row[0], row[1], msgspec.json.decode(row[2]) if row[2] else []
 
     @classmethod
     async def cancel(cls, conn: Any, job_ids: list[int]) -> int:
-        tag = await conn.execute(_CANCEL.format("$1"), job_ids)
+        tag = await conn.execute(cls.CANCEL, job_ids)
         return int(tag.rsplit(" ", 1)[-1])
 
 
 class PsycopgAdapter:
-    INSERT = (
-        f"INSERT INTO gylo_job ({_COLUMNS}) "
-        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s, %s) "
-        "RETURNING id"
-    )
-    INSERT_UNIQUE = (
-        f"WITH new AS (INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s, %s, %s) "
-        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING "
-        "RETURNING id) "
-        "SELECT id FROM new UNION ALL "
-        "SELECT id FROM gylo_job "
-        "WHERE unique_key = %s AND state IN ('available', 'running') LIMIT 1"
-    )
-    INSERT_MANY_UNIQUE = (
-        f"INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
-        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s, %s, %s) "
-        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING"
+    INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
+        ["%s"] * (len(_COLUMNS) + 2)
     )
 
     @classmethod
@@ -149,7 +157,7 @@ class PsycopgAdapter:
         cls, conn: Any, job_id: int
     ) -> tuple[str, bytes | None, Any] | None:
         async with conn.cursor() as cursor:
-            await cursor.execute(_OUTCOME.format("%s"), (job_id,))
+            await cursor.execute(cls.OUTCOME, (job_id,))
             row = await cursor.fetchone()
         if row is None:
             return None
@@ -158,16 +166,8 @@ class PsycopgAdapter:
     @classmethod
     async def cancel(cls, conn: Any, job_ids: list[int]) -> int:
         async with conn.cursor() as cursor:
-            await cursor.execute(_CANCEL.format("%s"), (job_ids,))
+            await cursor.execute(cls.CANCEL, (job_ids,))
             return cursor.rowcount
-
-
-_OUTCOME = "SELECT state::text, result, errors FROM gylo_job WHERE id = {}"
-_CANCEL = (
-    "UPDATE gylo_job SET state = 'cancelled', finalized_at = now(), "
-    "locked_by = NULL, lease_expires_at = NULL "
-    "WHERE id = ANY({}) AND state = 'available'"
-)
 
 
 _BY_MODULE: dict[str, type[Adapter]] = {

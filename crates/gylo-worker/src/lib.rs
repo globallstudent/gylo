@@ -82,6 +82,8 @@ pub struct Config {
     /// `module:attribute` path to the user's app object.
     pub app: String,
     pub python_path: Option<OsString>,
+    /// Extra environment for the child, on top of what the worker inherited.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl Default for Config {
@@ -103,6 +105,7 @@ impl Default for Config {
             python: PathBuf::from("python3"),
             app: String::new(),
             python_path: None,
+            env: Vec::new(),
         }
     }
 }
@@ -332,16 +335,29 @@ async fn session(
     };
     let (reader, writer) = accepted.0.into_split();
 
+    let (acks, ack_rx) = tokio::sync::mpsc::unbounded_channel();
     let completions = tokio::spawn(collect_completions(
         reader,
         pool.clone(),
         Arc::clone(inflight),
         config.clone(),
         worker,
+        acks,
     ));
 
     let outcome = tokio::select! {
-        result = dispatch(writer, pool.clone(), config, worker, inflight, wakeup, shutdown) => result,
+        result = dispatch(
+            writer,
+            Dispatching {
+                pool: pool.clone(),
+                config,
+                worker,
+                inflight,
+                wakeup,
+                shutdown,
+            },
+            ack_rx,
+        ) => result,
         status = child.wait() => Err(Error::ChildExited(match status {
             Ok(status) => status.to_string(),
             Err(error) => error.to_string(),
@@ -506,22 +522,51 @@ async fn fire_due_schedules(pool: &PgPool, limit: i64) {
     }
 }
 
+/// What the dispatch loop needs from the session around it.
+struct Dispatching<'a> {
+    pool: PgPool,
+    config: &'a Config,
+    worker: Uuid,
+    inflight: &'a InFlight,
+    wakeup: &'a Notify,
+    shutdown: &'a CancellationToken,
+}
+
 async fn dispatch(
     mut writer: OwnedWriteHalf,
-    pool: PgPool,
-    config: &Config,
-    worker: Uuid,
-    inflight: &InFlight,
-    wakeup: &Notify,
-    shutdown: &CancellationToken,
+    context: Dispatching<'_>,
+    mut acks: tokio::sync::mpsc::UnboundedReceiver<Message>,
 ) -> Result<(), Error> {
+    let Dispatching {
+        pool,
+        config,
+        worker,
+        inflight,
+        wakeup,
+        shutdown,
+    } = context;
     let mut buf = Vec::with_capacity(READ_BUFFER);
     let mut reserved = Vec::with_capacity(config.batch as usize);
 
     while !shutdown.is_cancelled() {
+        while let Ok(ack) = acks.try_recv() {
+            buf.clear();
+            if encode(&ack, &mut buf).is_ok() {
+                writer.write_all(&buf).await?;
+            }
+        }
+
         let available = inflight.available();
         if available == 0 {
             tokio::select! {
+                ack = acks.recv() => {
+                    if let Some(ack) = ack {
+                        buf.clear();
+                        if encode(&ack, &mut buf).is_ok() {
+                            writer.write_all(&buf).await?;
+                        }
+                    }
+                }
                 () = inflight.freed.notified() => {}
                 () = shutdown.cancelled() => break,
             }
@@ -543,6 +588,14 @@ async fn dispatch(
 
         if jobs.is_empty() {
             tokio::select! {
+                ack = acks.recv() => {
+                    if let Some(ack) = ack {
+                        buf.clear();
+                        if encode(&ack, &mut buf).is_ok() {
+                            writer.write_all(&buf).await?;
+                        }
+                    }
+                }
                 () = wakeup.notified() => {}
                 () = tokio::time::sleep(config.poll_interval) => {}
                 () = shutdown.cancelled() => break,
@@ -554,6 +607,19 @@ async fn dispatch(
         reserved.clear();
         for job in jobs {
             let id = job.id;
+            if job.durable && job.attempt > 1 {
+                match gylo_pg::steps_for(&pool, id).await {
+                    Ok(steps) if !steps.is_empty() => {
+                        if encode(&Message::Steps { id, steps }, &mut buf).is_err() {
+                            tracing::error!(job = id, "could not send prior steps");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(job = id, %error, "loading prior steps failed");
+                    }
+                }
+            }
             let message = Message::Dispatch {
                 id,
                 task: job.task,
@@ -673,6 +739,7 @@ async fn collect_completions(
     inflight: Arc<InFlight>,
     config: Config,
     worker: Uuid,
+    acks: tokio::sync::mpsc::UnboundedSender<Message>,
 ) {
     let batch = config.completion_batch;
     let linger = config.completion_linger;
@@ -711,6 +778,20 @@ async fn collect_completions(
                         }
                         Ok(Some(Message::Register(entries))) => {
                             register_schedules(&pool, &entries).await;
+                        }
+                        Ok(Some(Message::Record { id, name, result })) => {
+                            match gylo_pg::record_step(&pool, id, &name, &result).await {
+                                Ok(()) => {
+                                    let _ = acks.send(Message::Stored { id, name });
+                                }
+                                Err(error) => {
+                                    tracing::error!(job = id, step = %name, %error,
+                                        "recording a step failed; the child will wait");
+                                }
+                            }
+                        }
+                        Ok(Some(Message::Steps { .. } | Message::Stored { .. })) => {
+                            tracing::error!("python child sent a supervisor-only frame");
                         }
                         Ok(Some(Message::Dispatch { .. })) => {
                             tracing::error!("python child sent a dispatch frame");
@@ -751,6 +832,9 @@ fn spawn_child(config: &Config, socket: &Path) -> std::io::Result<Child> {
 
     if let Some(path) = &config.python_path {
         command.env("PYTHONPATH", path);
+    }
+    for (key, value) in &config.env {
+        command.env(key, value);
     }
     command.spawn()
 }

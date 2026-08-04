@@ -12,7 +12,7 @@ DSN = os.environ.get(
 @pytest.fixture
 async def conn():
     connection = await asyncpg.connect(DSN)
-    await connection.execute("TRUNCATE gylo_job")
+    await connection.execute("TRUNCATE gylo_job CASCADE")
     try:
         yield connection
     finally:

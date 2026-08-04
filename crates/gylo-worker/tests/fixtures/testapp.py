@@ -1,4 +1,6 @@
 import asyncio
+import os
+from pathlib import Path
 
 import gylo
 
@@ -75,3 +77,28 @@ async def adds(left: int, right: int) -> dict[str, int]:
 @app.task(name="unserialisable", store_result=True)
 async def unserialisable() -> object:
     return object()
+
+
+SIDE_EFFECTS = Path(os.environ.get("GYLO_TEST_EFFECTS", "/tmp/gylo-effects.log"))
+
+
+@app.task(name="two_steps", durable=True)
+async def two_steps(ctx, marker: str) -> None:
+    """Charges once as a step, then fails on its first attempt only."""
+
+    async def charge() -> str:
+        with SIDE_EFFECTS.open("a") as log:
+            log.write(f"{marker}:charge\n")
+        return f"{marker}-charged"
+
+    charged = await ctx.step("charge", charge)
+
+    with SIDE_EFFECTS.open("a") as log:
+        log.write(f"{marker}:attempt\n")
+    if SIDE_EFFECTS.read_text().count(f"{marker}:attempt") < 2:
+        raise RuntimeError("transient after the first step")
+
+    async def finish() -> str:
+        return charged
+
+    await ctx.step("finish", finish)

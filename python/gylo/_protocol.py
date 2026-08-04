@@ -23,6 +23,9 @@ HEADER_BYTES = 4
 KIND_DISPATCH = 0x00
 KIND_COMPLETE = 0x01
 KIND_REGISTER = 0x02
+KIND_STEPS = 0x03
+KIND_RECORD = 0x04
+KIND_STORED = 0x05
 OUTCOME_SUCCESS = 0x00
 OUTCOME_RETRY = 0x01
 OUTCOME_TERMINAL = 0x02
@@ -47,9 +50,31 @@ class Dispatch:
     payload: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class Steps:
+    """Steps a durable job already completed, replayed instead of repeated."""
+
+    id: int
+    steps: list[tuple[str, bytes]]
+
+
+@dataclass(frozen=True, slots=True)
+class Stored:
+    """The supervisor confirming a step is durable."""
+
+    id: int
+    name: str
+
+
 def encode_register(entries: list[tuple[str, str, str, str, str, bytes]]) -> bytes:
     """Frame the schedules this child declares, sent once on connect."""
     body = bytes([KIND_REGISTER]) + msgspec.msgpack.encode(entries)
+    return _LENGTH.pack(len(body)) + body
+
+
+def encode_record(job_id: int, name: str, result: bytes) -> bytes:
+    """Frame a completed step for the supervisor to make durable."""
+    body = bytes([KIND_RECORD]) + msgspec.msgpack.encode((job_id, name, result))
     return _LENGTH.pack(len(body)) + body
 
 
@@ -91,11 +116,11 @@ class Decoder:
     def extend(self, data: bytes) -> None:
         self._buf += data
 
-    def drain(self) -> list[Dispatch]:
+    def drain(self) -> list[Dispatch | Steps | Stored]:
         buf = self._buf
         size = len(buf)
         pos = 0
-        out: list[Dispatch] = []
+        out: list[Dispatch | Steps | Stored] = []
 
         while size - pos >= HEADER_BYTES:
             (body_len,) = _LENGTH.unpack_from(buf, pos)
@@ -107,18 +132,28 @@ class Decoder:
             if size - pos - HEADER_BYTES < body_len:
                 break
 
-            if body_len < _DISPATCH_HEAD_BYTES:
-                raise ProtocolError("frame body is truncated")
-
             body = pos + HEADER_BYTES
+            end = body + body_len
             kind = buf[body]
+
+            if kind in (KIND_STEPS, KIND_STORED):
+                unpacked = msgspec.msgpack.decode(bytes(buf[body + 1 : end]))
+                out.append(
+                    Steps(id=unpacked[0], steps=[tuple(s) for s in unpacked[1]])
+                    if kind == KIND_STEPS
+                    else Stored(id=unpacked[0], name=unpacked[1])
+                )
+                pos = end
+                continue
+
             if kind != KIND_DISPATCH:
                 raise ProtocolError(f"unexpected message kind {kind:#04x}")
+            if body_len < _DISPATCH_HEAD_BYTES:
+                raise ProtocolError("frame body is truncated")
 
             job_id, name_len = _DISPATCH_HEAD.unpack_from(buf, body + 1)
             name_at = body + 11
             payload_at = name_at + name_len
-            end = body + body_len
             if payload_at > end:
                 raise ProtocolError("frame body is truncated")
 

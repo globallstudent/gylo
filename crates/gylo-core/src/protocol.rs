@@ -11,6 +11,9 @@
 //! dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
 //! complete = 0x01 || i64 job_id || u8 outcome || error_utf8
 //! register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
+//! steps    = 0x03 || messagepack [job_id, [[name, result], ..]]
+//! record   = 0x04 || messagepack [job_id, name, result]
+//! stored   = 0x05 || messagepack [job_id, name]
 //!
 //! outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
 //!
@@ -23,6 +26,9 @@ const HEADER_BYTES: usize = 4;
 const KIND_DISPATCH: u8 = 0x00;
 const KIND_COMPLETE: u8 = 0x01;
 const KIND_REGISTER: u8 = 0x02;
+const KIND_STEPS: u8 = 0x03;
+const KIND_RECORD: u8 = 0x04;
+const KIND_STORED: u8 = 0x05;
 const OUTCOME_SUCCESS: u8 = 0x00;
 const OUTCOME_RETRY: u8 = 0x01;
 const OUTCOME_TERMINAL: u8 = 0x02;
@@ -39,6 +45,26 @@ pub enum Outcome {
     /// `retry` is decided by the child from the task's policy, since only it
     /// can see the exception type.
     Failure { error: String, retry: bool },
+}
+
+/// One replayed step on the wire.
+///
+/// `rmp-serde` writes a bare `Vec<u8>` as an array of integers rather than a
+/// MessagePack binary, which the Python side then decodes as a list. The
+/// annotation is what keeps both ends agreeing on bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WireStep {
+    name: String,
+    #[serde(with = "serde_bytes")]
+    result: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WireRecord {
+    id: i64,
+    name: String,
+    #[serde(with = "serde_bytes")]
+    result: Vec<u8>,
 }
 
 /// A schedule the child declared, sent once when it connects.
@@ -58,6 +84,26 @@ pub enum Message {
     /// MessagePack rather than hand-framed: it is a variable-shaped structure
     /// sent once per session, so the hot path's byte layout buys nothing here.
     Register(Vec<CronRegistration>),
+    /// Steps a durable job already completed, sent just before its dispatch so
+    /// the child can replay them instead of repeating their side effects.
+    /// Only sent when there are any, so an ordinary job carries no extra cost.
+    Steps {
+        id: i64,
+        steps: Vec<(String, Vec<u8>)>,
+    },
+    /// A step the child finished. It waits for [`Message::Stored`] before
+    /// continuing, because a step that is not durable yet is a step that will
+    /// be repeated.
+    Record {
+        id: i64,
+        name: String,
+        result: Vec<u8>,
+    },
+    /// Acknowledges that a recorded step is now durable.
+    Stored {
+        id: i64,
+        name: String,
+    },
     Dispatch {
         id: i64,
         task: String,
@@ -107,20 +153,42 @@ const DISPATCH_HEAD_BYTES: usize = 1 + 8 + 2;
 const COMPLETE_HEAD_BYTES: usize = 1 + 8 + 1;
 
 fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<(), ProtocolError> {
-    let registration;
+    let packed;
     let body_len = match message {
         Message::Register(entries) => {
-            registration = rmp_serde::to_vec(entries)
-                .map_err(|error| ProtocolError::BadRegistration(error.to_string()))?;
-            1 + registration.len()
+            packed = pack(entries)?;
+            1 + packed.len()
+        }
+        Message::Steps { id, steps } => {
+            let wire: Vec<WireStep> = steps
+                .iter()
+                .map(|(name, result)| WireStep {
+                    name: name.clone(),
+                    result: result.clone(),
+                })
+                .collect();
+            packed = pack(&(id, wire))?;
+            1 + packed.len()
+        }
+        Message::Record { id, name, result } => {
+            packed = pack(&WireRecord {
+                id: *id,
+                name: name.clone(),
+                result: result.clone(),
+            })?;
+            1 + packed.len()
+        }
+        Message::Stored { id, name } => {
+            packed = pack(&(id, name))?;
+            1 + packed.len()
         }
         Message::Dispatch { task, payload, .. } => {
-            registration = Vec::new();
+            packed = Vec::new();
             u16::try_from(task.len()).map_err(|_| ProtocolError::TaskNameTooLong(task.len()))?;
             DISPATCH_HEAD_BYTES + task.len() + payload.len()
         }
         Message::Complete { outcome, .. } => {
-            registration = Vec::new();
+            packed = Vec::new();
             match outcome {
                 Outcome::Success { result } => COMPLETE_HEAD_BYTES + result.len(),
                 Outcome::Failure { error, .. } => COMPLETE_HEAD_BYTES + error.len(),
@@ -138,7 +206,19 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
     match message {
         Message::Register(_) => {
             out.push(KIND_REGISTER);
-            out.extend_from_slice(&registration);
+            out.extend_from_slice(&packed);
+        }
+        Message::Steps { .. } => {
+            out.push(KIND_STEPS);
+            out.extend_from_slice(&packed);
+        }
+        Message::Record { .. } => {
+            out.push(KIND_RECORD);
+            out.extend_from_slice(&packed);
+        }
+        Message::Stored { .. } => {
+            out.push(KIND_STORED);
+            out.extend_from_slice(&packed);
         }
         Message::Dispatch { id, task, payload } => {
             let name_len = u16::try_from(task.len())
@@ -171,6 +251,14 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
 
     debug_assert_eq!(out.len() - start - HEADER_BYTES, body_len);
     Ok(())
+}
+
+fn pack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    rmp_serde::to_vec(value).map_err(|error| ProtocolError::BadRegistration(error.to_string()))
+}
+
+fn unpack<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolError> {
+    rmp_serde::from_slice(bytes).map_err(|error| ProtocolError::BadRegistration(error.to_string()))
 }
 
 /// Reassembles messages from arbitrarily chunked reads.
@@ -263,9 +351,20 @@ fn decode_body(body: &[u8]) -> Result<Message, ProtocolError> {
             };
             Ok(Message::Complete { id, outcome })
         }
-        KIND_REGISTER => rmp_serde::from_slice(rest)
-            .map(Message::Register)
-            .map_err(|error| ProtocolError::BadRegistration(error.to_string())),
+        KIND_REGISTER => unpack(rest).map(Message::Register),
+        KIND_STEPS => unpack(rest).map(|(id, steps): (i64, Vec<WireStep>)| Message::Steps {
+            id,
+            steps: steps
+                .into_iter()
+                .map(|step| (step.name, step.result))
+                .collect(),
+        }),
+        KIND_RECORD => unpack(rest).map(|record: WireRecord| Message::Record {
+            id: record.id,
+            name: record.name,
+            result: record.result,
+        }),
+        KIND_STORED => unpack(rest).map(|(id, name)| Message::Stored { id, name }),
         other => Err(ProtocolError::UnknownKind(other)),
     }
 }
@@ -319,6 +418,37 @@ mod tests {
             decoder.next_message(),
             Err(ProtocolError::BadRegistration(_))
         ));
+    }
+
+    #[test]
+    fn steps_round_trip() {
+        let message = Message::Steps {
+            id: 7,
+            steps: vec![
+                ("charge".to_owned(), vec![0x01]),
+                ("email".to_owned(), Vec::new()),
+            ],
+        };
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn a_recorded_step_round_trips() {
+        let message = Message::Record {
+            id: 7,
+            name: "charge".to_owned(),
+            result: vec![0x92, 0x01],
+        };
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn a_stored_acknowledgement_round_trips() {
+        let message = Message::Stored {
+            id: 7,
+            name: "charge".to_owned(),
+        };
+        assert_eq!(round_trip(&message), message);
     }
 
     #[test]

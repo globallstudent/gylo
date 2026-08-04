@@ -7,6 +7,7 @@ use gylo_pg::{NewJob, enqueue};
 use gylo_worker::{Config, run};
 use sqlx::{PgPool, Row};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -16,6 +17,10 @@ fn crate_dir() -> PathBuf {
 
 fn workspace_root() -> PathBuf {
     crate_dir().join("../..").canonicalize().unwrap()
+}
+
+fn effects_log() -> PathBuf {
+    std::env::temp_dir().join(format!("gylo-effects-{}.log", Uuid::new_v4()))
 }
 
 fn config() -> Config {
@@ -315,7 +320,17 @@ async fn a_transient_failure_is_retried_and_then_succeeds(pool: PgPool) {
 
     run_until_settled_with(&pool, quick_retries()).await;
 
-    assert_eq!(state_of(&pool, id).await, "completed");
+    let errors: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        state_of(&pool, id).await,
+        "completed",
+        "errors were: {errors}"
+    );
     assert_eq!(
         attempt_of(&pool, id).await,
         2,
@@ -635,6 +650,84 @@ async fn a_result_that_cannot_be_encoded_is_not_retried(pool: PgPool) {
         1,
         "the return value will not encode on a second attempt either"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_completed_step_is_replayed_rather_than_repeated(pool: PgPool) {
+    let log = effects_log();
+    std::fs::write(&log, b"").unwrap();
+
+    let mut job = NewJob::new("two_steps", payload(&[], &[("marker", "order-1")]));
+    job.durable = true;
+    job.max_attempts = 5;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(
+        &pool,
+        Config {
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
+            ..quick_retries()
+        },
+    )
+    .await;
+
+    let errors: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        state_of(&pool, id).await,
+        "completed",
+        "errors were: {errors}"
+    );
+    assert_eq!(
+        attempt_of(&pool, id).await,
+        2,
+        "the fixture fails once, so it must have taken a second attempt"
+    );
+
+    let effects = std::fs::read_to_string(&log).unwrap_or_default();
+    let charges = effects.matches("order-1:charge").count();
+    assert_eq!(
+        charges, 1,
+        "the charge step ran {charges} times; a replayed step must not repeat its \
+         side effect, effects were:\n{effects}"
+    );
+    let _ = std::fs::remove_file(&log);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn steps_are_recorded_against_the_job(pool: PgPool) {
+    let log = effects_log();
+    std::fs::write(&log, b"").unwrap();
+
+    let mut job = NewJob::new("two_steps", payload(&[], &[("marker", "order-2")]));
+    job.durable = true;
+    job.max_attempts = 5;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(
+        &pool,
+        Config {
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
+            ..quick_retries()
+        },
+    )
+    .await;
+
+    let names: Vec<String> =
+        sqlx::query("SELECT name FROM gylo_step WHERE job_id = $1 ORDER BY name")
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+    assert_eq!(names, vec!["charge".to_owned(), "finish".to_owned()]);
+    let _ = std::fs::remove_file(&log);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

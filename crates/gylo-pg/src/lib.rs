@@ -36,6 +36,8 @@ pub struct NewJob {
     pub delay: Duration,
     /// Set together: at most `max_concurrency` jobs sharing this key run at once.
     pub concurrency: Option<(String, i32)>,
+    /// Whether completed steps are kept so a retry can replay them.
+    pub durable: bool,
 }
 
 impl NewJob {
@@ -48,6 +50,7 @@ impl NewJob {
             max_attempts: 20,
             delay: Duration::ZERO,
             concurrency: None,
+            durable: false,
         }
     }
 
@@ -78,8 +81,8 @@ impl NewJob {
 
 const ENQUEUE: &str = "
     INSERT INTO gylo_job (queue, task, payload, priority, max_attempts, scheduled_at,
-                          concurrency_key, max_concurrency)
-    VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8)
+                          concurrency_key, max_concurrency, durable)
+    VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, $8, $9)
     RETURNING id
 ";
 
@@ -118,7 +121,7 @@ const FETCH: &str = "
         attempt = j.attempt + 1
     FROM admitted c
     WHERE j.id = c.id
-    RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts
+    RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts, j.durable
 ";
 
 const COMPLETE_WITH_RESULTS: &str = "
@@ -182,6 +185,16 @@ const DISCARD: &str = "
             'error', $3::text
         )
     WHERE id = $1 AND locked_by = $2 AND state = 'running'
+";
+
+const RECORD_STEP: &str = "
+    INSERT INTO gylo_step (job_id, name, result)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (job_id, name) DO NOTHING
+";
+
+const STEPS_FOR: &str = "
+    SELECT name, result FROM gylo_step WHERE job_id = $1 ORDER BY created_at, name
 ";
 
 const RECLAIM: &str = "
@@ -405,6 +418,7 @@ pub async fn enqueue<'e, E: PgExecutor<'e>>(executor: E, job: &NewJob) -> Result
         .bind(job.delay.as_secs_f64())
         .bind(job.concurrency.as_ref().map(|(key, _)| key.as_str()))
         .bind(job.concurrency.as_ref().map(|(_, at_once)| *at_once))
+        .bind(job.durable)
         .fetch_one(executor)
         .await?;
     Ok(row.try_get("id")?)
@@ -440,6 +454,7 @@ pub async fn fetch<'e, E: PgExecutor<'e>>(
                 payload: row.try_get("payload")?,
                 attempt: row.try_get("attempt")?,
                 max_attempts: row.try_get("max_attempts")?,
+                durable: row.try_get("durable")?,
             })
         })
         .collect()
@@ -681,4 +696,31 @@ pub async fn outcome<'e, E: PgExecutor<'e>>(
         })
     })
     .transpose()
+}
+
+/// Records a completed step. Ignores a repeat, so a step reported twice after
+/// a crash between the write and its acknowledgement stays a single record.
+pub async fn record_step<'e, E: PgExecutor<'e>>(
+    executor: E,
+    job: i64,
+    name: &str,
+    result: &[u8],
+) -> Result<(), Error> {
+    sqlx::query(RECORD_STEP)
+        .bind(job)
+        .bind(name)
+        .bind(result)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+pub async fn steps_for<'e, E: PgExecutor<'e>>(
+    executor: E,
+    job: i64,
+) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    let rows = sqlx::query(STEPS_FOR).bind(job).fetch_all(executor).await?;
+    rows.into_iter()
+        .map(|row| Ok((row.try_get("name")?, row.try_get("result")?)))
+        .collect()
 }

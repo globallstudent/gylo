@@ -65,7 +65,7 @@ impl Harness {
     async fn reset(&self) {
         let _ = std::fs::remove_file(&self.ledger);
         std::fs::write(&self.ledger, b"").unwrap();
-        sqlx::query("TRUNCATE gylo_job")
+        sqlx::query("TRUNCATE gylo_job CASCADE")
             .execute(&self.pool)
             .await
             .unwrap();

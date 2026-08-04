@@ -21,10 +21,14 @@ from . import Gylo, UnknownTaskError
 from ._protocol import (
     Decoder,
     Dispatch,
+    Steps,
+    Stored,
     encode_failure,
+    encode_record,
     encode_register,
     encode_success,
 )
+from ._steps import StepAcks, StepContext
 
 READ_BYTES = 1 << 16
 _decode_payload = msgspec.msgpack.Decoder().decode
@@ -46,7 +50,12 @@ async def _fail(writer: asyncio.StreamWriter, job_id: int, *, retry: bool) -> No
     await writer.drain()
 
 
-async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -> None:
+async def _execute(
+    app: Gylo,
+    message: Dispatch,
+    writer: asyncio.StreamWriter,
+    context: StepContext | None,
+) -> None:
     """Run one job and report how it went.
 
     Only a failure raised by the task body consults the retry policy. An
@@ -68,7 +77,10 @@ async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -
         return
 
     try:
-        returned = task.fn(*args, **kwargs)
+        if context is not None:
+            returned = task.fn(context, *args, **kwargs)
+        else:
+            returned = task.fn(*args, **kwargs)
         if inspect.isawaitable(returned):
             returned = await returned
     except Exception as error:
@@ -94,6 +106,14 @@ async def serve(app: Gylo, socket: str) -> None:
 
     decoder = Decoder()
     running: set[asyncio.Task[None]] = set()
+    acks = StepAcks()
+    replays: dict[int, dict[str, bytes]] = {}
+
+    def record(job_id: int, name: str, result: bytes) -> None:
+        writer.write(encode_record(job_id, name, result))
+
+    async def confirm(job_id: int, name: str) -> None:
+        await acks.expect(job_id, name)
 
     while True:
         chunk = await reader.read(READ_BYTES)
@@ -101,10 +121,24 @@ async def serve(app: Gylo, socket: str) -> None:
             break
         decoder.extend(chunk)
         for message in decoder.drain():
-            job = asyncio.ensure_future(_execute(app, message, writer))
+            if isinstance(message, Steps):
+                replays[message.id] = dict(message.steps)
+                continue
+            if isinstance(message, Stored):
+                acks.resolve(message.id, message.name)
+                continue
+
+            task = app.get(message.task) if message.task in app.names else None
+            context = (
+                StepContext(message.id, replays.pop(message.id, {}), record, confirm)
+                if task is not None and task.durable
+                else None
+            )
+            job = asyncio.ensure_future(_execute(app, message, writer, context))
             running.add(job)
             job.add_done_callback(running.discard)
 
+    acks.abandon()
     if running:
         await asyncio.gather(*running, return_exceptions=True)
     writer.close()

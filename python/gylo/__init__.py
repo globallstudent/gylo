@@ -10,6 +10,7 @@ from typing import Any
 import msgspec
 
 from ._adapters import UnsupportedDriverError, adapter_for
+from ._steps import StepContext
 
 __all__ = [
     "BoundTask",
@@ -18,6 +19,7 @@ __all__ = [
     "JobOutcome",
     "NoRetryError",
     "Options",
+    "StepContext",
     "Task",
     "UnknownTaskError",
     "UnsupportedDriverError",
@@ -46,7 +48,7 @@ class Task:
     usable as an ordinary function in tests and from other tasks.
     """
 
-    __slots__ = ("fn", "name", "no_retry_on", "retry_on", "store_result")
+    __slots__ = ("durable", "fn", "name", "no_retry_on", "retry_on", "store_result")
 
     def __init__(
         self,
@@ -55,12 +57,14 @@ class Task:
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         no_retry_on: tuple[type[BaseException], ...] = (),
         store_result: bool = False,
+        durable: bool = False,
     ) -> None:
         self.name = name
         self.fn = fn
         self.retry_on = retry_on
         self.no_retry_on = no_retry_on
         self.store_result = store_result
+        self.durable = durable
 
     def should_retry(self, error: BaseException) -> bool:
         """Whether `error` earns another attempt.
@@ -213,6 +217,7 @@ class BoundTask:
             float(self.options.delay),
             self.options.concurrency_key,
             self.options.max_concurrency,
+            self.task.durable,
         )
         if self.options.unique is False:
             return row
@@ -265,8 +270,13 @@ class Gylo:
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         no_retry_on: tuple[type[BaseException], ...] = (),
         store_result: bool = False,
+        durable: bool = False,
     ) -> Any:
         """Register a function as a task, bare or called with arguments.
+
+        `durable` gives the task a step context as its first argument. Steps it
+        completes are recorded, and a retry replays them rather than repeating
+        their side effects.
 
         `store_result` keeps the return value for later retrieval. It is off by
         default because most jobs are run for their effects, and storing what
@@ -277,7 +287,7 @@ class Gylo:
             task_name = name or f"{func.__module__}.{func.__qualname__}"
             if task_name in self._tasks:
                 raise ValueError(f"task {task_name!r} is already registered")
-            task = Task(task_name, func, retry_on, no_retry_on, store_result)
+            task = Task(task_name, func, retry_on, no_retry_on, store_result, durable)
             self._tasks[task_name] = task
             return task
 
