@@ -131,3 +131,83 @@ async def test_options_leave_the_task_defaults_alone(conn):
 
     record = await row(conn, job_id)
     assert record["queue"] == "default"
+
+
+@app.task(name="rebuild_index")
+async def rebuild_index(tenant: str, *, full: bool = False) -> None:
+    pass
+
+
+async def test_a_unique_job_is_only_queued_once(conn):
+    first = await rebuild_index.options(unique=True).enqueue(conn, "acme")
+    second = await rebuild_index.options(unique=True).enqueue(conn, "acme")
+
+    assert first == second, "the second enqueue should return the job already queued"
+    assert await count(conn) == 1
+
+
+async def test_uniqueness_is_per_argument_set(conn):
+    await rebuild_index.options(unique=True).enqueue(conn, "acme")
+    await rebuild_index.options(unique=True).enqueue(conn, "other")
+
+    assert await count(conn) == 2
+
+
+async def test_keyword_order_does_not_change_the_key(conn):
+    first = await rebuild_index.options(unique=True).enqueue(conn, "acme", full=True)
+
+    kwargs = {"full": True}
+    second = await rebuild_index.options(unique=True).enqueue(conn, "acme", **kwargs)
+
+    assert first == second
+    assert await count(conn) == 1
+
+
+async def test_an_explicit_key_deduplicates_regardless_of_arguments(conn):
+    first = await rebuild_index.options(unique="nightly").enqueue(conn, "acme")
+    second = await rebuild_index.options(unique="nightly").enqueue(conn, "different")
+
+    assert first == second
+    assert await count(conn) == 1
+
+
+async def test_the_same_key_on_another_task_does_not_collide(conn):
+    await rebuild_index.options(unique="shared").enqueue(conn, "acme")
+    await send_receipt.options(unique="shared").enqueue(conn, 1, email="a@b.c")
+
+    assert await count(conn) == 2
+
+
+async def test_uniqueness_is_scoped_to_the_queue(conn):
+    await rebuild_index.options(unique=True, queue="a").enqueue(conn, "acme")
+    await rebuild_index.options(unique=True, queue="b").enqueue(conn, "acme")
+
+    assert await count(conn) == 2
+
+
+async def test_a_finished_job_frees_its_key(conn):
+    first = await rebuild_index.options(unique=True).enqueue(conn, "acme")
+    await conn.execute(
+        "UPDATE gylo_job SET state = 'completed', finalized_at = now() WHERE id = $1",
+        first,
+    )
+
+    second = await rebuild_index.options(unique=True).enqueue(conn, "acme")
+
+    assert second != first, "once the first run finished, the job may be queued again"
+    assert await count(conn) == 2
+
+
+async def test_a_non_unique_job_is_never_deduplicated(conn):
+    await rebuild_index.enqueue(conn, "acme")
+    await rebuild_index.enqueue(conn, "acme")
+
+    assert await count(conn) == 2
+
+
+async def test_enqueue_many_deduplicates_within_the_batch(conn):
+    await rebuild_index.options(unique=True).enqueue_many(
+        conn, [(("acme",), {}), (("acme",), {}), (("other",), {})]
+    )
+
+    assert await count(conn) == 2

@@ -13,6 +13,7 @@ from typing import Any, Protocol
 __all__ = ["UnsupportedDriverError", "adapter_for"]
 
 _COLUMNS = "queue, task, payload, priority, max_attempts, scheduled_at"
+_UNIQUE_PREDICATE = "unique_key IS NOT NULL AND state IN ('available', 'running')"
 
 
 class UnsupportedDriverError(TypeError):
@@ -21,12 +22,19 @@ class UnsupportedDriverError(TypeError):
 
 class Adapter(Protocol):
     INSERT: str
+    INSERT_UNIQUE: str
+    INSERT_MANY_UNIQUE: str
 
     @classmethod
     async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int: ...
 
     @classmethod
-    async def insert_many(cls, conn: Any, rows: list[tuple[Any, ...]]) -> None: ...
+    async def insert_unique(cls, conn: Any, params: tuple[Any, ...]) -> int: ...
+
+    @classmethod
+    async def insert_many(
+        cls, conn: Any, rows: list[tuple[Any, ...]], *, unique: bool
+    ) -> None: ...
 
 
 class AsyncpgAdapter:
@@ -35,14 +43,34 @@ class AsyncpgAdapter:
         "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6)) "
         "RETURNING id"
     )
+    INSERT_UNIQUE = (
+        f"WITH new AS (INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
+        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7) "
+        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING "
+        "RETURNING id) "
+        "SELECT id FROM new UNION ALL "
+        "SELECT id FROM gylo_job "
+        "WHERE unique_key = $7 AND state IN ('available', 'running') LIMIT 1"
+    )
+    INSERT_MANY_UNIQUE = (
+        f"INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
+        "VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7) "
+        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING"
+    )
 
     @classmethod
     async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int:
         return await conn.fetchval(cls.INSERT, *params)
 
     @classmethod
-    async def insert_many(cls, conn: Any, rows: list[tuple[Any, ...]]) -> None:
-        await conn.executemany(cls.INSERT, rows)
+    async def insert_unique(cls, conn: Any, params: tuple[Any, ...]) -> int:
+        return await conn.fetchval(cls.INSERT_UNIQUE, *params)
+
+    @classmethod
+    async def insert_many(
+        cls, conn: Any, rows: list[tuple[Any, ...]], *, unique: bool
+    ) -> None:
+        await conn.executemany(cls.INSERT_MANY_UNIQUE if unique else cls.INSERT, rows)
 
 
 class PsycopgAdapter:
@@ -50,6 +78,20 @@ class PsycopgAdapter:
         f"INSERT INTO gylo_job ({_COLUMNS}) "
         "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s)) "
         "RETURNING id"
+    )
+    INSERT_UNIQUE = (
+        f"WITH new AS (INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
+        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s) "
+        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING "
+        "RETURNING id) "
+        "SELECT id FROM new UNION ALL "
+        "SELECT id FROM gylo_job "
+        "WHERE unique_key = %s AND state IN ('available', 'running') LIMIT 1"
+    )
+    INSERT_MANY_UNIQUE = (
+        f"INSERT INTO gylo_job ({_COLUMNS}, unique_key) "
+        "VALUES (%s, %s, %s, %s, %s, now() + make_interval(secs => %s), %s) "
+        f"ON CONFLICT (unique_key) WHERE {_UNIQUE_PREDICATE} DO NOTHING"
     )
 
     @classmethod
@@ -60,9 +102,20 @@ class PsycopgAdapter:
         return row[0]
 
     @classmethod
-    async def insert_many(cls, conn: Any, rows: list[tuple[Any, ...]]) -> None:
+    async def insert_unique(cls, conn: Any, params: tuple[Any, ...]) -> int:
         async with conn.cursor() as cursor:
-            await cursor.executemany(cls.INSERT, rows)
+            await cursor.execute(cls.INSERT_UNIQUE, (*params, params[-1]))
+            row = await cursor.fetchone()
+        return row[0]
+
+    @classmethod
+    async def insert_many(
+        cls, conn: Any, rows: list[tuple[Any, ...]], *, unique: bool
+    ) -> None:
+        async with conn.cursor() as cursor:
+            await cursor.executemany(
+                cls.INSERT_MANY_UNIQUE if unique else cls.INSERT, rows
+            )
 
 
 _BY_MODULE: dict[str, type[Adapter]] = {

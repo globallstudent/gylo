@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -80,18 +81,24 @@ class Task:
         priority: int | None = None,
         delay: float | None = None,
         max_attempts: int | None = None,
+        unique: bool | str | None = None,
     ) -> BoundTask:
         """Bind enqueue options for the next call.
 
         Options live here rather than on `enqueue` so they cannot collide with
         the task's own parameters — a task is free to take an argument called
         `queue` or `priority`.
+
+        `unique=True` deduplicates on the arguments; `unique="key"` on a key
+        you choose. Either way a job already waiting or running blocks a second
+        one, and enqueue returns the id of the job that is already there.
         """
         given = {
             "queue": queue,
             "priority": priority,
             "delay": delay,
             "max_attempts": max_attempts,
+            "unique": unique,
         }
         return BoundTask(
             self, Options(**{k: v for k, v in given.items() if v is not None})
@@ -120,6 +127,27 @@ class Options:
     priority: int = 0
     delay: float = 0.0
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    unique: bool | str = False
+
+
+def _unique_key(
+    task: str, options: Options, args: Sequence[Any], kwargs: dict
+) -> bytes:
+    """Digest identifying a job for deduplication.
+
+    Keyword arguments are sorted, because dictionaries encode in insertion
+    order and callers should not have to pass them in a fixed one. The task
+    name and queue are always included, so an explicit key given to two
+    different tasks does not collide.
+    """
+    identity: Any = (
+        options.unique
+        if isinstance(options.unique, str)
+        else (tuple(args), sorted(kwargs.items()))
+    )
+    return hashlib.blake2b(
+        _encode((task, options.queue, identity)), digest_size=32
+    ).digest()
 
 
 class BoundTask:
@@ -132,7 +160,7 @@ class BoundTask:
         self.options = options
 
     def _row(self, args: Sequence[Any], kwargs: dict[str, Any]) -> tuple[Any, ...]:
-        return (
+        row = (
             self.options.queue,
             self.task.name,
             _encode((tuple(args), kwargs)),
@@ -140,9 +168,20 @@ class BoundTask:
             self.options.max_attempts,
             float(self.options.delay),
         )
+        if self.options.unique is False:
+            return row
+        return (*row, _unique_key(self.task.name, self.options, args, kwargs))
 
     async def enqueue(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
-        return await adapter_for(conn).insert(conn, self._row(args, kwargs))
+        """Insert the job, returning its id.
+
+        With `unique` set, the id may belong to a job that was already queued.
+        """
+        adapter = adapter_for(conn)
+        row = self._row(args, kwargs)
+        if self.options.unique is False:
+            return await adapter.insert(conn, row)
+        return await adapter.insert_unique(conn, row)
 
     async def enqueue_many(
         self,
@@ -158,7 +197,9 @@ class BoundTask:
         if not calls:
             return
         rows = [self._row(call_args, call_kwargs) for call_args, call_kwargs in calls]
-        await adapter_for(conn).insert_many(conn, rows)
+        await adapter_for(conn).insert_many(
+            conn, rows, unique=self.options.unique is not False
+        )
 
 
 class Gylo:
