@@ -92,6 +92,31 @@ const FETCH: &str = "
     RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts
 ";
 
+const COMPLETE_WITH_RESULTS: &str = "
+    UPDATE gylo_job j
+    SET state = 'completed',
+        finalized_at = now(),
+        locked_by = NULL,
+        lease_expires_at = NULL,
+        result = v.result
+    FROM unnest($1::bigint[], $2::bytea[]) AS v(id, result)
+    WHERE j.id = v.id AND j.locked_by = $3 AND j.state = 'running'
+";
+
+const CANCEL: &str = "
+    UPDATE gylo_job
+    SET state = 'cancelled',
+        finalized_at = now(),
+        locked_by = NULL,
+        lease_expires_at = NULL
+    WHERE id = ANY($1) AND state = 'available'
+";
+
+const RESULT: &str = "
+    SELECT state::text AS state, result, errors
+    FROM gylo_job WHERE id = $1
+";
+
 const COMPLETE_MANY: &str = "
     UPDATE gylo_job
     SET state = 'completed',
@@ -558,4 +583,65 @@ pub async fn fire_cron<'e, E: PgExecutor<'e>>(
     row.map(|row| row.try_get("id"))
         .transpose()
         .map_err(Error::from)
+}
+
+/// Finalises jobs that produced a return value, storing each alongside its own
+/// job. Kept separate from [`complete_many`] so the common case — a task that
+/// stores nothing — does not carry an array of nulls.
+pub async fn complete_many_with_results<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    results: &[Vec<u8>],
+    worker: Uuid,
+) -> Result<u64, Error> {
+    debug_assert_eq!(ids.len(), results.len());
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(COMPLETE_WITH_RESULTS)
+        .bind(ids)
+        .bind(results)
+        .bind(worker)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Cancels jobs that have not started, returning how many were still waiting.
+///
+/// A running job is left alone: interrupting Python mid-task would mean
+/// killing the child and taking every sibling job with it. Cancelling what has
+/// not begun is the part that can be done honestly.
+pub async fn cancel<'e, E: PgExecutor<'e>>(executor: E, ids: &[i64]) -> Result<u64, Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(CANCEL).bind(ids).execute(executor).await?;
+    Ok(result.rows_affected())
+}
+
+/// How a job ended, for a caller waiting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOutcome {
+    pub state: String,
+    pub result: Option<Vec<u8>>,
+    pub errors: serde_json::Value,
+}
+
+pub async fn outcome<'e, E: PgExecutor<'e>>(
+    executor: E,
+    id: i64,
+) -> Result<Option<JobOutcome>, Error> {
+    let row = sqlx::query(RESULT)
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
+    row.map(|row| {
+        Ok(JobOutcome {
+            state: row.try_get("state")?,
+            result: row.try_get("result")?,
+            errors: row.try_get("errors")?,
+        })
+    })
+    .transpose()
 }

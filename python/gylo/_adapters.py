@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+import msgspec
+
 __all__ = ["UnsupportedDriverError", "adapter_for"]
 
 _COLUMNS = "queue, task, payload, priority, max_attempts, scheduled_at"
@@ -35,6 +37,14 @@ class Adapter(Protocol):
     async def insert_many(
         cls, conn: Any, rows: list[tuple[Any, ...]], *, unique: bool
     ) -> None: ...
+
+    @classmethod
+    async def outcome(
+        cls, conn: Any, job_id: int
+    ) -> tuple[str, bytes | None, Any] | None: ...
+
+    @classmethod
+    async def cancel(cls, conn: Any, job_ids: list[int]) -> int: ...
 
 
 class AsyncpgAdapter:
@@ -71,6 +81,20 @@ class AsyncpgAdapter:
         cls, conn: Any, rows: list[tuple[Any, ...]], *, unique: bool
     ) -> None:
         await conn.executemany(cls.INSERT_MANY_UNIQUE if unique else cls.INSERT, rows)
+
+    @classmethod
+    async def outcome(
+        cls, conn: Any, job_id: int
+    ) -> tuple[str, bytes | None, Any] | None:
+        row = await conn.fetchrow(_OUTCOME.format("$1"), job_id)
+        if row is None:
+            return None
+        return row[0], row[1], msgspec.json.decode(row[2]) if row[2] else []
+
+    @classmethod
+    async def cancel(cls, conn: Any, job_ids: list[int]) -> int:
+        tag = await conn.execute(_CANCEL.format("$1"), job_ids)
+        return int(tag.rsplit(" ", 1)[-1])
 
 
 class PsycopgAdapter:
@@ -116,6 +140,31 @@ class PsycopgAdapter:
             await cursor.executemany(
                 cls.INSERT_MANY_UNIQUE if unique else cls.INSERT, rows
             )
+
+    @classmethod
+    async def outcome(
+        cls, conn: Any, job_id: int
+    ) -> tuple[str, bytes | None, Any] | None:
+        async with conn.cursor() as cursor:
+            await cursor.execute(_OUTCOME.format("%s"), (job_id,))
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return row[0], row[1], row[2] or []
+
+    @classmethod
+    async def cancel(cls, conn: Any, job_ids: list[int]) -> int:
+        async with conn.cursor() as cursor:
+            await cursor.execute(_CANCEL.format("%s"), (job_ids,))
+            return cursor.rowcount
+
+
+_OUTCOME = "SELECT state::text, result, errors FROM gylo_job WHERE id = {}"
+_CANCEL = (
+    "UPDATE gylo_job SET state = 'cancelled', finalized_at = now(), "
+    "locked_by = NULL, lease_expires_at = NULL "
+    "WHERE id = ANY({}) AND state = 'available'"
+)
 
 
 _BY_MODULE: dict[str, type[Adapter]] = {

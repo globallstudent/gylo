@@ -1,6 +1,7 @@
 import msgspec
 import pytest
 
+import gylo
 from gylo import Gylo, UnsupportedDriverError
 
 app = Gylo()
@@ -211,3 +212,71 @@ async def test_enqueue_many_deduplicates_within_the_batch(conn):
     )
 
     assert await count(conn) == 2
+
+
+@app.task(name="compute", store_result=True)
+async def compute(a: int, b: int) -> dict[str, int]:
+    return {"sum": a + b}
+
+
+@app.task(name="effect_only")
+async def effect_only() -> str:
+    return "discarded"
+
+
+async def test_a_result_is_retrievable_after_the_job_finishes(conn):
+    job_id = await compute.enqueue(conn, 2, 3)
+    await conn.execute(
+        "UPDATE gylo_job SET state = 'completed', finalized_at = now(), result = $2 "
+        "WHERE id = $1",
+        job_id,
+        msgspec.msgpack.encode({"sum": 5}),
+    )
+
+    found = await gylo.outcome(conn, job_id)
+
+    assert found.succeeded
+    assert found.result == {"sum": 5}
+
+
+async def test_an_unfinished_job_reports_its_state(conn):
+    job_id = await compute.enqueue(conn, 1, 1)
+
+    found = await gylo.outcome(conn, job_id)
+
+    assert found.state == "available"
+    assert not found.finished
+    assert found.result is None
+
+
+async def test_a_missing_job_has_no_outcome(conn):
+    assert await gylo.outcome(conn, 999_999) is None
+
+
+async def test_cancelling_a_waiting_job_finalises_it(conn):
+    job_id = await compute.enqueue(conn, 1, 1)
+
+    assert await gylo.cancel(conn, job_id) == 1
+
+    found = await gylo.outcome(conn, job_id)
+    assert found.state == "cancelled"
+    assert found.finished
+    assert not found.succeeded
+
+
+async def test_cancelling_a_running_job_leaves_it_alone(conn):
+    job_id = await compute.enqueue(conn, 1, 1)
+    await conn.execute(
+        "UPDATE gylo_job SET state = 'running', locked_by = gen_random_uuid(), "
+        "lease_expires_at = now() + interval '1 minute' WHERE id = $1",
+        job_id,
+    )
+
+    assert await gylo.cancel(conn, job_id) == 0, (
+        "stopping a running task would mean killing the worker's child"
+    )
+    assert (await gylo.outcome(conn, job_id)).state == "running"
+
+
+async def test_cancelling_nothing_is_a_no_op(conn):
+    assert await gylo.cancel(conn) == 0

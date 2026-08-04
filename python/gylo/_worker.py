@@ -68,14 +68,22 @@ async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -
         return
 
     try:
-        result = task.fn(*args, **kwargs)
-        if inspect.isawaitable(result):
-            await result
+        returned = task.fn(*args, **kwargs)
+        if inspect.isawaitable(returned):
+            returned = await returned
     except Exception as error:
         await _fail(writer, message.id, retry=task.should_retry(error))
         return
 
-    writer.write(encode_success(message.id))
+    stored = b""
+    if task.store_result:
+        try:
+            stored = msgspec.msgpack.encode(returned)
+        except TypeError, ValueError:
+            await _fail(writer, message.id, retry=False)
+            return
+
+    writer.write(encode_success(message.id, stored))
     await writer.drain()
 
 

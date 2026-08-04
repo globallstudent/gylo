@@ -13,6 +13,10 @@
 //! register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
 //!
 //! outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
+//!
+//! The bytes after the outcome are the task's return value when it succeeded
+//! and the rendered error when it did not. A task that stores no result sends
+//! none, so the common case costs nothing.
 //! ```
 
 const HEADER_BYTES: usize = 4;
@@ -30,13 +34,11 @@ pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Success,
+    /// `result` is empty unless the task opted into storing one.
+    Success { result: Vec<u8> },
     /// `retry` is decided by the child from the task's policy, since only it
     /// can see the exception type.
-    Failure {
-        error: String,
-        retry: bool,
-    },
+    Failure { error: String, retry: bool },
 }
 
 /// A schedule the child declared, sent once when it connects.
@@ -120,7 +122,7 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
         Message::Complete { outcome, .. } => {
             registration = Vec::new();
             match outcome {
-                Outcome::Success => COMPLETE_HEAD_BYTES,
+                Outcome::Success { result } => COMPLETE_HEAD_BYTES + result.len(),
                 Outcome::Failure { error, .. } => COMPLETE_HEAD_BYTES + error.len(),
             }
         }
@@ -151,7 +153,10 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
             out.push(KIND_COMPLETE);
             out.extend_from_slice(&id.to_le_bytes());
             match outcome {
-                Outcome::Success => out.push(OUTCOME_SUCCESS),
+                Outcome::Success { result } => {
+                    out.push(OUTCOME_SUCCESS);
+                    out.extend_from_slice(result);
+                }
                 Outcome::Failure { error, retry } => {
                     out.push(if *retry {
                         OUTCOME_RETRY
@@ -245,7 +250,9 @@ fn decode_body(body: &[u8]) -> Result<Message, ProtocolError> {
             }
             let id = i64::from_le_bytes(rest[..8].try_into().expect("slice is 8 long"));
             let outcome = match rest[8] {
-                OUTCOME_SUCCESS => Outcome::Success,
+                OUTCOME_SUCCESS => Outcome::Success {
+                    result: rest[9..].to_vec(),
+                },
                 code @ (OUTCOME_RETRY | OUTCOME_TERMINAL) => Outcome::Failure {
                     error: std::str::from_utf8(&rest[9..])
                         .map_err(|_| ProtocolError::NotUtf8("error message"))?
@@ -323,7 +330,18 @@ mod tests {
     fn success_round_trips() {
         let message = Message::Complete {
             id: 7,
-            outcome: Outcome::Success,
+            outcome: Outcome::Success { result: Vec::new() },
+        };
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn a_success_carrying_a_result_round_trips() {
+        let message = Message::Complete {
+            id: 7,
+            outcome: Outcome::Success {
+                result: vec![0x92, 0x01, 0x02],
+            },
         };
         assert_eq!(round_trip(&message), message);
     }
@@ -398,7 +416,7 @@ mod tests {
             encode(
                 &Message::Complete {
                     id,
-                    outcome: Outcome::Success,
+                    outcome: Outcome::Success { result: Vec::new() },
                 },
                 &mut buf,
             )
@@ -411,7 +429,7 @@ mod tests {
                 decoder.next_message().unwrap().unwrap(),
                 Message::Complete {
                     id,
-                    outcome: Outcome::Success
+                    outcome: Outcome::Success { result: Vec::new() }
                 }
             );
         }
@@ -514,7 +532,7 @@ mod tests {
         encode(
             &Message::Complete {
                 id: 1,
-                outcome: Outcome::Success,
+                outcome: Outcome::Success { result: Vec::new() },
             },
             &mut buf,
         )

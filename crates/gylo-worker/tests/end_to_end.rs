@@ -582,6 +582,62 @@ async fn a_child_that_cannot_start_gives_up_with_its_error(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn a_stored_result_survives_to_the_row(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("adds", payload(&[2, 3], &[])))
+        .await
+        .unwrap();
+
+    run_until_settled(&pool).await;
+
+    assert_eq!(state_of(&pool, id).await, "completed");
+    let stored: Option<Vec<u8>> = sqlx::query("SELECT result FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    let decoded: serde_json::Value =
+        rmp_serde::from_slice(&stored.expect("a task with store_result must leave one")).unwrap();
+    assert_eq!(decoded["sum"], 5);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_task_without_store_result_leaves_none(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("ok", Vec::new()))
+        .await
+        .unwrap();
+
+    run_until_settled(&pool).await;
+
+    let stored: Option<Vec<u8>> = sqlx::query("SELECT result FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        stored.is_none(),
+        "storing what nobody asked for costs a write"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_result_that_cannot_be_encoded_is_not_retried(pool: PgPool) {
+    let mut job = NewJob::new("unserialisable", Vec::new());
+    job.max_attempts = 10;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(state_of(&pool, id).await, "discarded");
+    assert_eq!(
+        attempt_of(&pool, id).await,
+        1,
+        "the return value will not encode on a second attempt either"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn a_batch_of_jobs_all_complete(pool: PgPool) {
     for _ in 0..250 {
         enqueue(&pool, &NewJob::new("ok", Vec::new()))

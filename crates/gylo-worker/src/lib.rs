@@ -584,6 +584,8 @@ async fn dispatch(
 #[derive(Default)]
 struct Pending {
     completed: Vec<i64>,
+    with_result: Vec<i64>,
+    results: Vec<Vec<u8>>,
     retry: Vec<i64>,
     retry_errors: Vec<String>,
     terminal: Vec<i64>,
@@ -593,7 +595,11 @@ struct Pending {
 impl Pending {
     fn push(&mut self, id: i64, outcome: Outcome) {
         match outcome {
-            Outcome::Success => self.completed.push(id),
+            Outcome::Success { result } if result.is_empty() => self.completed.push(id),
+            Outcome::Success { result } => {
+                self.with_result.push(id);
+                self.results.push(result);
+            }
             Outcome::Failure { error, retry: true } => {
                 self.retry.push(id);
                 self.retry_errors.push(error);
@@ -609,7 +615,7 @@ impl Pending {
     }
 
     fn len(&self) -> usize {
-        self.completed.len() + self.retry.len() + self.terminal.len()
+        self.completed.len() + self.with_result.len() + self.retry.len() + self.terminal.len()
     }
 
     async fn flush(&mut self, pool: &PgPool, inflight: &InFlight, config: &Config, worker: Uuid) {
@@ -618,6 +624,12 @@ impl Pending {
         }
         if let Err(error) = gylo_pg::complete_many(pool, &self.completed, worker).await {
             tracing::error!(%error, jobs = self.completed.len(), "recording completions failed");
+        }
+        if let Err(error) =
+            gylo_pg::complete_many_with_results(pool, &self.with_result, &self.results, worker)
+                .await
+        {
+            tracing::error!(%error, jobs = self.with_result.len(), "recording results failed");
         }
         if let Err(error) = gylo_pg::retry_many(
             pool,
@@ -639,9 +651,12 @@ impl Pending {
 
         let mut settled = Vec::with_capacity(self.len());
         settled.extend_from_slice(&self.completed);
+        settled.extend_from_slice(&self.with_result);
         settled.extend_from_slice(&self.retry);
         settled.extend_from_slice(&self.terminal);
         self.completed.clear();
+        self.with_result.clear();
+        self.results.clear();
         self.retry.clear();
         self.retry_errors.clear();
         self.terminal.clear();

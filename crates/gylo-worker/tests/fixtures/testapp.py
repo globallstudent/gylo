@@ -65,3 +65,13 @@ async def every_second() -> None:
 @app.cron("0 3 * * *", name="nightly", timezone="Europe/London")
 async def nightly() -> None:
     pass
+
+
+@app.task(name="adds", store_result=True)
+async def adds(left: int, right: int) -> dict[str, int]:
+    return {"sum": left + right}
+
+
+@app.task(name="unserialisable", store_result=True)
+async def unserialisable() -> object:
+    return object()

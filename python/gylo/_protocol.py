@@ -53,8 +53,13 @@ def encode_register(entries: list[tuple[str, str, str, str, str, bytes]]) -> byt
     return _LENGTH.pack(len(body)) + body
 
 
-def encode_success(job_id: int) -> bytes:
-    return _COMPLETE.pack(_COMPLETE_BODY_BYTES, KIND_COMPLETE, job_id, OUTCOME_SUCCESS)
+def encode_success(job_id: int, result: bytes = b"") -> bytes:
+    return (
+        _COMPLETE.pack(
+            _COMPLETE_BODY_BYTES + len(result), KIND_COMPLETE, job_id, OUTCOME_SUCCESS
+        )
+        + result
+    )
 
 
 def encode_failure(job_id: int, error: str, *, retry: bool) -> bytes:

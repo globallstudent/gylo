@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -15,11 +15,14 @@ __all__ = [
     "BoundTask",
     "CronEntry",
     "Gylo",
+    "JobOutcome",
     "NoRetryError",
     "Options",
     "Task",
     "UnknownTaskError",
     "UnsupportedDriverError",
+    "cancel",
+    "outcome",
 ]
 
 DEFAULT_QUEUE = "default"
@@ -43,7 +46,7 @@ class Task:
     usable as an ordinary function in tests and from other tasks.
     """
 
-    __slots__ = ("fn", "name", "no_retry_on", "retry_on")
+    __slots__ = ("fn", "name", "no_retry_on", "retry_on", "store_result")
 
     def __init__(
         self,
@@ -51,11 +54,13 @@ class Task:
         fn: Callable[..., Any],
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         no_retry_on: tuple[type[BaseException], ...] = (),
+        store_result: bool = False,
     ) -> None:
         self.name = name
         self.fn = fn
         self.retry_on = retry_on
         self.no_retry_on = no_retry_on
+        self.store_result = store_result
 
     def should_retry(self, error: BaseException) -> bool:
         """Whether `error` earns another attempt.
@@ -241,14 +246,20 @@ class Gylo:
         name: str | None = None,
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         no_retry_on: tuple[type[BaseException], ...] = (),
+        store_result: bool = False,
     ) -> Any:
-        """Register a function as a task, bare or called with arguments."""
+        """Register a function as a task, bare or called with arguments.
+
+        `store_result` keeps the return value for later retrieval. It is off by
+        default because most jobs are run for their effects, and storing what
+        nobody reads costs a write and a row that cannot be pruned.
+        """
 
         def register(func: Callable[..., Any]) -> Task:
             task_name = name or f"{func.__module__}.{func.__qualname__}"
             if task_name in self._tasks:
                 raise ValueError(f"task {task_name!r} is already registered")
-            task = Task(task_name, func, retry_on, no_retry_on)
+            task = Task(task_name, func, retry_on, no_retry_on, store_result)
             self._tasks[task_name] = task
             return task
 
@@ -303,3 +314,47 @@ class Gylo:
     @property
     def names(self) -> frozenset[str]:
         return frozenset(self._tasks)
+
+
+@dataclass(frozen=True, slots=True)
+class JobOutcome:
+    """How a job ended, for a caller that went looking."""
+
+    state: str
+    result: Any = None
+    errors: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def finished(self) -> bool:
+        return self.state in {"completed", "discarded", "cancelled"}
+
+    @property
+    def succeeded(self) -> bool:
+        return self.state == "completed"
+
+
+async def outcome(conn: Any, job_id: int) -> JobOutcome | None:
+    """Look up how a job ended, or None if no such job exists.
+
+    `result` is only populated for tasks registered with `store_result=True`.
+    """
+    row = await adapter_for(conn).outcome(conn, job_id)
+    if row is None:
+        return None
+    state, stored, errors = row
+    return JobOutcome(
+        state=state,
+        result=None if stored is None else msgspec.msgpack.decode(stored),
+        errors=errors or [],
+    )
+
+
+async def cancel(conn: Any, *job_ids: int) -> int:
+    """Cancel jobs that have not started, returning how many were still waiting.
+
+    A job already running is left alone: stopping Python mid-task would mean
+    killing the worker's child and every sibling job with it.
+    """
+    if not job_ids:
+        return 0
+    return await adapter_for(conn).cancel(conn, list(job_ids))
