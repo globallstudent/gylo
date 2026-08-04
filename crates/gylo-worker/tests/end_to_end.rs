@@ -33,6 +33,10 @@ fn config() -> Config {
         python: workspace_root().join(".venv/bin/python3"),
         python_path: Some(python_path),
         poll_interval: Duration::from_millis(10),
+        // one child unless a test asks for more: several of these assert on
+        // state a task kept in its own process, which only holds when every
+        // attempt lands in the same one
+        processes: 1,
         ..Config::default()
     }
 }
@@ -765,4 +769,37 @@ async fn required_features_are_checked_before_anything_starts(pool: PgPool) {
     run(pool, config, shutdown)
         .await
         .expect("postgres provides everything gylo asks of it");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backlog_is_shared_across_children(pool: PgPool) {
+    for _ in 0..200 {
+        enqueue(&pool, &NewJob::new("whoami", payload(&[], &[])))
+            .await
+            .unwrap();
+    }
+
+    run_until_settled_with(
+        &pool,
+        Config {
+            processes: 4,
+            ..config()
+        },
+    )
+    .await;
+
+    let rows = sqlx::query("SELECT result FROM gylo_job WHERE result IS NOT NULL")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let ran_by: std::collections::HashSet<i64> = rows
+        .iter()
+        .map(|row| rmp_serde::from_slice(row.get::<Vec<u8>, _>(0).as_slice()).unwrap())
+        .collect();
+
+    assert_eq!(rows.len(), 200);
+    assert!(
+        ran_by.len() > 1,
+        "every job ran in one child, so the others were leasing nothing: {ran_by:?}"
+    );
 }

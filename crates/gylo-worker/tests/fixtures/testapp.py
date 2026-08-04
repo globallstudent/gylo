@@ -69,6 +69,11 @@ async def nightly() -> None:
     pass
 
 
+@app.task(name="whoami", store_result=True)
+async def whoami() -> int:
+    return os.getpid()
+
+
 @app.task(name="adds", store_result=True)
 async def adds(left: int, right: int) -> dict[str, int]:
     return {"sum": left + right}
