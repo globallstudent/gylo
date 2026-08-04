@@ -11,6 +11,11 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{PgExecutor, Row};
 use uuid::Uuid;
 
+/// Channel a statement-level trigger notifies on insert, carrying the queue
+/// name. `NOTIFY` is transactional, so a worker is woken at commit and never
+/// before the row it is being told about is visible.
+pub const AVAILABLE_CHANNEL: &str = "gylo_available";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -96,6 +101,30 @@ const COMPLETE: &str = "
     WHERE id = $1 AND state = 'running'
 ";
 
+const COMPLETE_MANY: &str = "
+    UPDATE gylo_job
+    SET state = 'completed',
+        finalized_at = now(),
+        locked_by = NULL,
+        lease_expires_at = NULL
+    WHERE id = ANY($1) AND state = 'running'
+";
+
+const DISCARD_MANY: &str = "
+    UPDATE gylo_job j
+    SET state = 'discarded',
+        finalized_at = now(),
+        locked_by = NULL,
+        lease_expires_at = NULL,
+        errors = j.errors || jsonb_build_object(
+            'attempt', j.attempt,
+            'at', now(),
+            'error', v.error
+        )
+    FROM unnest($1::bigint[], $2::text[]) AS v(id, error)
+    WHERE j.id = v.id AND j.state = 'running'
+";
+
 const DISCARD: &str = "
     UPDATE gylo_job
     SET state = 'discarded',
@@ -109,6 +138,107 @@ const DISCARD: &str = "
         )
     WHERE id = $1 AND state = 'running'
 ";
+
+const RECLAIM: &str = "
+    WITH expired AS (
+        SELECT id, queue, attempt >= max_attempts AS exhausted
+        FROM gylo_job
+        WHERE state = 'running' AND lease_expires_at < now()
+        LIMIT $1
+    ),
+    released AS (
+        UPDATE gylo_job j
+        SET state = 'available', locked_by = NULL, lease_expires_at = NULL
+        FROM expired e
+        WHERE j.id = e.id AND NOT e.exhausted AND j.state = 'running'
+        RETURNING j.queue
+    ),
+    exhausted AS (
+        UPDATE gylo_job j
+        SET state = 'discarded',
+            finalized_at = now(),
+            locked_by = NULL,
+            lease_expires_at = NULL,
+            errors = j.errors || jsonb_build_object(
+                'attempt', j.attempt,
+                'at', now(),
+                'error', 'lease expired before the worker reported an outcome'
+            )
+        FROM expired e
+        WHERE j.id = e.id AND e.exhausted AND j.state = 'running'
+        RETURNING j.id
+    ),
+    woken AS (
+        SELECT pg_notify('gylo_available', ready.queue)
+        FROM (SELECT DISTINCT queue FROM released) AS ready
+    )
+    SELECT
+        (SELECT count(*) FROM released)  AS released,
+        (SELECT count(*) FROM exhausted) AS exhausted,
+        (SELECT count(*) FROM woken)     AS woken
+";
+
+const RENEW: &str = "
+    UPDATE gylo_job
+    SET lease_expires_at = now() + make_interval(secs => $2)
+    WHERE id = ANY($1) AND state = 'running'
+";
+
+/// Extends the lease on jobs still being worked, so a task that outlives its
+/// original lease is not reclaimed and run a second time.
+pub async fn renew_leases<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    lease: Duration,
+) -> Result<u64, Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(RENEW)
+        .bind(ids)
+        .bind(lease.as_secs_f64())
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+const ABANDON: &str = "
+    UPDATE gylo_job
+    SET lease_expires_at = now() - interval '1 microsecond'
+    WHERE id = ANY($1) AND state = 'running'
+";
+
+/// Expires leases the caller knows it can no longer honour, so the next sweep
+/// recovers them immediately instead of after the full lease duration.
+pub async fn abandon_leases<'e, E: PgExecutor<'e>>(executor: E, ids: &[i64]) -> Result<u64, Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(ABANDON).bind(ids).execute(executor).await?;
+    Ok(result.rows_affected())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reclaimed {
+    /// Returned to `available` for another worker to pick up.
+    pub released: i64,
+    /// Out of attempts, so dead-lettered instead of retried.
+    pub exhausted: i64,
+}
+
+/// A job with attempts left goes back to `available`; one without is
+/// dead-lettered. That split keeps `attempt <= max_attempts` true, since every
+/// fetch increments and the constraint would otherwise reject a whole batch.
+pub async fn reclaim_expired<'e, E: PgExecutor<'e>>(
+    executor: E,
+    limit: i64,
+) -> Result<Reclaimed, Error> {
+    let row = sqlx::query(RECLAIM).bind(limit).fetch_one(executor).await?;
+    Ok(Reclaimed {
+        released: row.try_get("released")?,
+        exhausted: row.try_get("exhausted")?,
+    })
+}
 
 pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, Error> {
     Ok(PgPoolOptions::new()
@@ -183,4 +313,35 @@ pub async fn discard<'e, E: PgExecutor<'e>>(
         .execute(executor)
         .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// One statement, one commit, rather than one of each per job.
+pub async fn complete_many<'e, E: PgExecutor<'e>>(executor: E, ids: &[i64]) -> Result<u64, Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(COMPLETE_MANY)
+        .bind(ids)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Batched [`discard`]. `ids` and `errors` are zipped positionally, so they
+/// must be the same length.
+pub async fn discard_many<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    errors: &[String],
+) -> Result<u64, Error> {
+    debug_assert_eq!(ids.len(), errors.len());
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(DISCARD_MANY)
+        .bind(ids)
+        .bind(errors)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
 }

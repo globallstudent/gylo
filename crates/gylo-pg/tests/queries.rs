@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use gylo_pg::{NewJob, complete, discard, enqueue, fetch};
+use gylo_pg::{
+    NewJob, complete, complete_many, discard, discard_many, enqueue, fetch, reclaim_expired,
+};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -176,6 +178,169 @@ async fn discarding_records_the_attempt_history(pool: PgPool) {
     assert_eq!(errors.as_array().unwrap().len(), 1);
     assert_eq!(errors[0]["error"], "ValueError: nope");
     assert_eq!(errors[0]["attempt"], 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn complete_many_finalises_the_whole_batch(pool: PgPool) {
+    for _ in 0..50 {
+        enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    }
+    let jobs = fetch(&pool, "default", 50, LEASE, worker()).await.unwrap();
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+
+    assert_eq!(complete_many(&pool, &ids).await.unwrap(), 50);
+
+    for id in ids {
+        assert_eq!(state_of(&pool, id).await, "completed");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn complete_many_skips_jobs_nobody_leased(pool: PgPool) {
+    let leased = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    let untouched = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+
+    assert_eq!(
+        complete_many(&pool, &[leased, untouched]).await.unwrap(),
+        1,
+        "only the leased job should be finalised"
+    );
+    assert_eq!(state_of(&pool, leased).await, "completed");
+    assert_eq!(state_of(&pool, untouched).await, "available");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn discard_many_pairs_each_error_with_its_own_job(pool: PgPool) {
+    for _ in 0..5 {
+        enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    }
+    let jobs = fetch(&pool, "default", 5, LEASE, worker()).await.unwrap();
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    let errors: Vec<String> = ids.iter().map(|id| format!("failure for {id}")).collect();
+
+    assert_eq!(discard_many(&pool, &ids, &errors).await.unwrap(), 5);
+
+    for id in &ids {
+        assert_eq!(state_of(&pool, *id).await, "discarded");
+        let recorded: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(recorded[0]["error"], format!("failure for {id}"));
+        assert_eq!(recorded[0]["attempt"], 1);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn empty_batches_are_a_no_op(pool: PgPool) {
+    assert_eq!(complete_many(&pool, &[]).await.unwrap(), 0);
+    assert_eq!(discard_many(&pool, &[], &[]).await.unwrap(), 0);
+}
+
+async fn expire_lease(pool: &PgPool, id: i64) {
+    sqlx::query("UPDATE gylo_job SET lease_expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_expired_lease_returns_the_job_to_the_queue(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+    expire_lease(&pool, id).await;
+
+    let reclaimed = reclaim_expired(&pool, 100).await.unwrap();
+
+    assert_eq!(reclaimed.released, 1);
+    assert_eq!(reclaimed.exhausted, 0);
+    assert_eq!(state_of(&pool, id).await, "available");
+    assert_eq!(
+        fetch(&pool, "default", 10, LEASE, worker())
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a reclaimed job must be fetchable again"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_live_lease_is_left_alone(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+
+    assert_eq!(
+        reclaim_expired(&pool, 100).await.unwrap(),
+        gylo_pg::Reclaimed::default()
+    );
+    assert_eq!(state_of(&pool, id).await, "running");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_job_out_of_attempts_is_dead_lettered_rather_than_retried(pool: PgPool) {
+    let mut job = NewJob::new("t", Vec::new());
+    job.max_attempts = 1;
+    let id = enqueue(&pool, &job).await.unwrap();
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+    expire_lease(&pool, id).await;
+
+    let reclaimed = reclaim_expired(&pool, 100).await.unwrap();
+
+    assert_eq!(reclaimed.released, 0);
+    assert_eq!(reclaimed.exhausted, 1);
+    assert_eq!(state_of(&pool, id).await, "discarded");
+
+    let errors: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        errors[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("lease expired")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reclaim_never_pushes_attempt_past_its_limit(pool: PgPool) {
+    let mut job = NewJob::new("t", Vec::new());
+    job.max_attempts = 3;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    for expected in 1..=3 {
+        let jobs = fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+        assert_eq!(jobs[0].attempt, expected);
+        expire_lease(&pool, id).await;
+        reclaim_expired(&pool, 100).await.unwrap();
+    }
+
+    assert_eq!(
+        state_of(&pool, id).await,
+        "discarded",
+        "the third expiry exhausts the job rather than violating the attempt bound"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reclaim_honours_its_limit(pool: PgPool) {
+    for _ in 0..10 {
+        enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    }
+    let jobs = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    for job in &jobs {
+        expire_lease(&pool, job.id).await;
+    }
+
+    assert_eq!(reclaim_expired(&pool, 4).await.unwrap().released, 4);
+    assert_eq!(reclaim_expired(&pool, 100).await.unwrap().released, 6);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

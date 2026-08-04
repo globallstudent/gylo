@@ -4,10 +4,10 @@
 //! Dispatch and completion run as independent tasks over the same socket, so
 //! neither direction waits on a round trip.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gylo_core::{Decoder, Message, Outcome, encode};
@@ -22,6 +22,9 @@ use uuid::Uuid;
 
 const READ_BUFFER: usize = 1 << 16;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const LISTEN_RETRY: Duration = Duration::from_secs(1);
+const RESTART_DELAY: Duration = Duration::from_millis(250);
+const DATABASE_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -33,6 +36,8 @@ pub enum Error {
     Protocol(#[from] gylo_core::ProtocolError),
     #[error("python child did not connect within {0:?}")]
     HandshakeTimeout(Duration),
+    #[error("python child exited: {0}")]
+    ChildExited(String),
 }
 
 #[derive(Debug, Clone)]
@@ -41,10 +46,22 @@ pub struct Config {
     /// Jobs in flight in the child at once; also caps how far ahead of the
     /// child the supervisor will lease.
     pub concurrency: usize,
+    /// Jobs leased per round trip. Throughput keeps climbing well past the
+    /// default, but every leased job is one that waits for lease expiry if the
+    /// worker dies, so this is bounded for recovery latency rather than speed.
     pub batch: i64,
-    /// How long a lease is held before maintenance may reclaim it.
+    /// How long a lease is held before maintenance may reclaim it. Renewed
+    /// every `maintenance_interval` while a job is still running, so this
+    /// bounds recovery time rather than task duration.
     pub lease: Duration,
     pub poll_interval: Duration,
+    pub completion_batch: usize,
+    /// How long a partial completion batch waits for company before flushing.
+    pub completion_linger: Duration,
+    /// Cadence for renewing held leases and reclaiming abandoned ones. Must
+    /// stay comfortably below `lease` or live jobs will be reclaimed.
+    pub maintenance_interval: Duration,
+    pub reclaim_limit: i64,
     pub python: PathBuf,
     /// `module:attribute` path to the user's app object.
     pub app: String,
@@ -55,10 +72,14 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             queue: "default".to_owned(),
-            concurrency: 64,
-            batch: 64,
+            concurrency: 256,
+            batch: 128,
             lease: Duration::from_secs(30),
             poll_interval: Duration::from_millis(200),
+            completion_batch: 100,
+            completion_linger: Duration::from_millis(5),
+            maintenance_interval: Duration::from_secs(10),
+            reclaim_limit: 1000,
             python: PathBuf::from("python3"),
             app: String::new(),
             python_path: None,
@@ -74,50 +95,156 @@ impl Drop for SocketGuard {
     }
 }
 
-struct Capacity {
-    inflight: AtomicUsize,
+/// Jobs handed to the child but not yet finalised.
+///
+/// Holds ids rather than a count so maintenance can renew exactly the leases
+/// this worker still owns, and so a failed session can hand back exactly what
+/// it was holding.
+struct InFlight {
+    ids: Mutex<HashSet<i64>>,
     limit: usize,
     freed: Notify,
     drained: Notify,
 }
 
-impl Capacity {
+impl InFlight {
     fn new(limit: usize) -> Self {
         Self {
-            inflight: AtomicUsize::new(0),
+            ids: Mutex::new(HashSet::with_capacity(limit)),
             limit,
             freed: Notify::new(),
             drained: Notify::new(),
         }
     }
 
+    fn held(&self) -> usize {
+        self.ids
+            .lock()
+            .expect("in-flight set is not poisoned")
+            .len()
+    }
+
     fn available(&self) -> usize {
-        self.limit
-            .saturating_sub(self.inflight.load(Ordering::Acquire))
+        self.limit.saturating_sub(self.held())
     }
 
-    fn reserve(&self, count: usize) {
-        self.inflight.fetch_add(count, Ordering::AcqRel);
+    fn is_idle(&self) -> bool {
+        self.held() == 0
     }
 
-    fn release(&self) {
-        if self.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+    fn snapshot(&self) -> Vec<i64> {
+        self.ids
+            .lock()
+            .expect("in-flight set is not poisoned")
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn take(&self) -> Vec<i64> {
+        let mut held = self.ids.lock().expect("in-flight set is not poisoned");
+        let ids = held.iter().copied().collect();
+        held.clear();
+        ids
+    }
+
+    fn reserve(&self, ids: &[i64]) {
+        let mut held = self.ids.lock().expect("in-flight set is not poisoned");
+        held.extend(ids.iter().copied());
+    }
+
+    fn release(&self, ids: &[i64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let empty = {
+            let mut held = self.ids.lock().expect("in-flight set is not poisoned");
+            for id in ids {
+                held.remove(id);
+            }
+            held.is_empty()
+        };
+        if empty {
             self.drained.notify_waiters();
         }
         self.freed.notify_one();
     }
-
-    fn is_idle(&self) -> bool {
-        self.inflight.load(Ordering::Acquire) == 0
-    }
 }
 
 /// Run until `shutdown` is cancelled, then drain in-flight work and stop.
+///
+/// A dying child ends its session but not the worker: the session is rebuilt
+/// around a fresh child and whatever it held is handed back for another
+/// attempt. Surviving that is the reason task code runs in its own process.
 pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> Result<(), Error> {
+    let inflight = Arc::new(InFlight::new(config.concurrency));
+    let wakeup = Arc::new(Notify::new());
+
+    let listening = tokio::spawn(listen(
+        pool.clone(),
+        config.queue.clone(),
+        Arc::clone(&wakeup),
+        shutdown.clone(),
+    ));
+    let maintaining = tokio::spawn(maintain(
+        pool.clone(),
+        config.clone(),
+        Arc::clone(&inflight),
+        shutdown.clone(),
+    ));
+
+    while !shutdown.is_cancelled() {
+        match session(&pool, &config, &inflight, &wakeup, &shutdown).await {
+            Ok(()) => break,
+            Err(error) => {
+                tracing::error!(%error, "worker session ended, restarting the python child");
+                hand_back(&pool, &inflight, &config).await;
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(RESTART_DELAY) => {}
+                }
+            }
+        }
+    }
+
+    listening.abort();
+    maintaining.abort();
+    Ok(())
+}
+
+/// Releases whatever the dead session was holding so another attempt can start
+/// now rather than after the lease runs out.
+async fn hand_back(pool: &PgPool, inflight: &InFlight, config: &Config) {
+    let held = inflight.take();
+    if held.is_empty() {
+        return;
+    }
+    if let Err(error) = gylo_pg::abandon_leases(pool, &held).await {
+        tracing::error!(%error, jobs = held.len(), "could not release abandoned jobs");
+        return;
+    }
+    match gylo_pg::reclaim_expired(pool, config.reclaim_limit).await {
+        Ok(reclaimed) => tracing::info!(
+            released = reclaimed.released,
+            exhausted = reclaimed.exhausted,
+            "handed back jobs from the failed session"
+        ),
+        Err(error) => tracing::error!(%error, "reclaiming after a failed session failed"),
+    }
+}
+
+/// One child process, from spawn until it or the socket fails.
+async fn session(
+    pool: &PgPool,
+    config: &Config,
+    inflight: &Arc<InFlight>,
+    wakeup: &Notify,
+    shutdown: &CancellationToken,
+) -> Result<(), Error> {
     let path = socket_path();
-    let _guard = SocketGuard(path.clone());
+    let guard = SocketGuard(path.clone());
     let listener = UnixListener::bind(&path)?;
-    let mut child = spawn_child(&config, &path)?;
+    let mut child = spawn_child(config, &path)?;
 
     let handshake = Duration::from_secs(30);
     let accepted = tokio::time::timeout(handshake, listener.accept())
@@ -125,56 +252,151 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
         .map_err(|_| Error::HandshakeTimeout(handshake))??;
     let (reader, writer) = accepted.0.into_split();
 
-    let capacity = Arc::new(Capacity::new(config.concurrency));
     let completions = tokio::spawn(collect_completions(
         reader,
         pool.clone(),
-        Arc::clone(&capacity),
+        Arc::clone(inflight),
+        config.completion_batch,
+        config.completion_linger,
     ));
 
-    let outcome = dispatch(writer, pool, &config, &capacity, &shutdown).await;
+    let outcome = tokio::select! {
+        result = dispatch(writer, pool.clone(), config, inflight, wakeup, shutdown) => result,
+        status = child.wait() => Err(Error::ChildExited(match status {
+            Ok(status) => status.to_string(),
+            Err(error) => error.to_string(),
+        })),
+    };
 
-    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
-    while !capacity.is_idle() && tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            () = capacity.drained.notified() => {}
-            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    if shutdown.is_cancelled() {
+        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+        while !inflight.is_idle() && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                () = inflight.drained.notified() => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        if !inflight.is_idle() {
+            tracing::warn!(
+                jobs = inflight.held(),
+                "drain timed out; leases will be reclaimed by maintenance"
+            );
         }
     }
-    if !capacity.is_idle() {
-        tracing::warn!("drain timed out; leases will be reclaimed by maintenance");
-    }
 
-    drop(_guard);
+    drop(guard);
     let _ = child.kill().await;
     let _ = completions.await;
     outcome
+}
+
+/// Wakes the dispatcher when a job lands on its queue. Failures here are
+/// survivable: the dispatcher still polls, so losing the listener costs
+/// latency rather than correctness.
+async fn listen(pool: PgPool, queue: String, wakeup: Arc<Notify>, shutdown: CancellationToken) {
+    loop {
+        match sqlx::postgres::PgListener::connect_with(&pool).await {
+            Ok(mut listener) => {
+                if let Err(error) = listener.listen(gylo_pg::AVAILABLE_CHANNEL).await {
+                    tracing::warn!(%error, "could not listen for job notifications");
+                } else {
+                    loop {
+                        tokio::select! {
+                            () = shutdown.cancelled() => return,
+                            received = listener.recv() => match received {
+                                Ok(notification) if notification.payload() == queue => {
+                                    wakeup.notify_one();
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "job notification stream ended");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not open a notification connection"),
+        }
+
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(LISTEN_RETRY) => {}
+        }
+    }
+}
+
+/// Renewal and recovery share a cadence because both are bounded by the lease.
+async fn maintain(
+    pool: PgPool,
+    config: Config,
+    inflight: Arc<InFlight>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(config.maintenance_interval) => {}
+        }
+
+        let held = inflight.snapshot();
+        if let Err(error) = gylo_pg::renew_leases(&pool, &held, config.lease).await {
+            tracing::error!(%error, jobs = held.len(), "renewing leases failed");
+        }
+
+        match gylo_pg::reclaim_expired(&pool, config.reclaim_limit).await {
+            Ok(reclaimed) if reclaimed != gylo_pg::Reclaimed::default() => {
+                tracing::info!(
+                    released = reclaimed.released,
+                    exhausted = reclaimed.exhausted,
+                    "recovered abandoned leases"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "reclaiming abandoned leases failed"),
+        }
+    }
 }
 
 async fn dispatch(
     mut writer: OwnedWriteHalf,
     pool: PgPool,
     config: &Config,
-    capacity: &Capacity,
+    inflight: &InFlight,
+    wakeup: &Notify,
     shutdown: &CancellationToken,
 ) -> Result<(), Error> {
     let worker = Uuid::new_v4();
     let mut buf = Vec::with_capacity(READ_BUFFER);
+    let mut reserved = Vec::with_capacity(config.batch as usize);
 
     while !shutdown.is_cancelled() {
-        let available = capacity.available();
+        let available = inflight.available();
         if available == 0 {
             tokio::select! {
-                () = capacity.freed.notified() => {}
+                () = inflight.freed.notified() => {}
                 () = shutdown.cancelled() => break,
             }
             continue;
         }
 
         let limit = config.batch.min(available as i64);
-        let jobs = gylo_pg::fetch(&pool, &config.queue, limit, config.lease, worker).await?;
+        let jobs = match gylo_pg::fetch(&pool, &config.queue, limit, config.lease, worker).await {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::warn!(%error, "leasing jobs failed, retrying");
+                tokio::select! {
+                    () = tokio::time::sleep(DATABASE_RETRY) => {}
+                    () = shutdown.cancelled() => break,
+                }
+                continue;
+            }
+        };
+
         if jobs.is_empty() {
             tokio::select! {
+                () = wakeup.notified() => {}
                 () = tokio::time::sleep(config.poll_interval) => {}
                 () = shutdown.cancelled() => break,
             }
@@ -182,27 +404,27 @@ async fn dispatch(
         }
 
         buf.clear();
-        let mut reserved = 0usize;
+        reserved.clear();
         for job in jobs {
+            let id = job.id;
             let message = Message::Dispatch {
-                id: job.id,
+                id,
                 task: job.task,
                 payload: job.payload,
             };
             match encode(&message, &mut buf) {
-                Ok(()) => reserved += 1,
+                Ok(()) => reserved.push(id),
                 Err(error) => {
-                    let Message::Dispatch { id, .. } = message else {
-                        unreachable!("message was constructed as a dispatch")
-                    };
                     tracing::error!(job = id, %error, "job could not be encoded, discarding");
-                    gylo_pg::discard(&pool, id, &error.to_string()).await?;
+                    if let Err(error) = gylo_pg::discard(&pool, id, &error.to_string()).await {
+                        tracing::error!(job = id, %error, "discarding the job failed");
+                    }
                 }
             }
         }
 
-        if reserved > 0 {
-            capacity.reserve(reserved);
+        if !reserved.is_empty() {
+            inflight.reserve(&reserved);
             writer.write_all(&buf).await?;
         }
     }
@@ -210,51 +432,115 @@ async fn dispatch(
     Ok(())
 }
 
-async fn collect_completions(mut reader: OwnedReadHalf, pool: PgPool, capacity: Arc<Capacity>) {
-    let mut decoder = Decoder::new();
-    let mut chunk = vec![0u8; READ_BUFFER];
+#[derive(Default)]
+struct Pending {
+    completed: Vec<i64>,
+    failed: Vec<i64>,
+    errors: Vec<String>,
+}
 
-    loop {
-        let read = match reader.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) => {
-                tracing::error!(%error, "reading from python child failed");
-                break;
-            }
-        };
-        decoder.extend(&chunk[..read]);
-
-        loop {
-            match decoder.next_message() {
-                Ok(None) => break,
-                Ok(Some(message)) => apply(&pool, &capacity, message).await,
-                Err(error) => {
-                    tracing::error!(%error, "python child sent an unreadable frame");
-                    return;
-                }
+impl Pending {
+    fn push(&mut self, id: i64, outcome: Outcome) {
+        match outcome {
+            Outcome::Success => self.completed.push(id),
+            Outcome::Failure(error) => {
+                self.failed.push(id);
+                self.errors.push(error);
             }
         }
     }
+
+    fn len(&self) -> usize {
+        self.completed.len() + self.failed.len()
+    }
+
+    async fn flush(&mut self, pool: &PgPool, inflight: &InFlight) {
+        if self.len() == 0 {
+            return;
+        }
+        if let Err(error) = gylo_pg::complete_many(pool, &self.completed).await {
+            tracing::error!(%error, jobs = self.completed.len(), "recording completions failed");
+        }
+        if let Err(error) = gylo_pg::discard_many(pool, &self.failed, &self.errors).await {
+            tracing::error!(%error, jobs = self.failed.len(), "recording failures failed");
+        }
+
+        let mut settled = Vec::with_capacity(self.len());
+        settled.extend_from_slice(&self.completed);
+        settled.extend_from_slice(&self.failed);
+        self.completed.clear();
+        self.failed.clear();
+        self.errors.clear();
+        inflight.release(&settled);
+    }
 }
 
-async fn apply(pool: &PgPool, capacity: &Capacity, message: Message) {
-    let Message::Complete { id, outcome } = message else {
-        tracing::error!("python child sent a dispatch frame");
-        return;
-    };
+/// Jobs are released only once their batch is durable, so the pending buffer
+/// stays bounded by the concurrency limit and cannot outrun Postgres.
+async fn collect_completions(
+    mut reader: OwnedReadHalf,
+    pool: PgPool,
+    inflight: Arc<InFlight>,
+    batch: usize,
+    linger: Duration,
+) {
+    let mut decoder = Decoder::new();
+    let mut chunk = vec![0u8; READ_BUFFER];
+    let mut pending = Pending::default();
+    let mut deadline: Option<tokio::time::Instant> = None;
 
-    let result = match &outcome {
-        Outcome::Success => gylo_pg::complete(pool, id).await,
-        Outcome::Failure(error) => gylo_pg::discard(pool, id, error).await,
-    };
+    loop {
+        let timer = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
 
-    match result {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(job = id, "completion arrived for a job we no longer hold"),
-        Err(error) => tracing::error!(job = id, %error, "recording completion failed"),
+        tokio::select! {
+            read = reader.read(&mut chunk) => {
+                match read {
+                    Ok(0) => break,
+                    Err(error) => {
+                        tracing::error!(%error, "reading from python child failed");
+                        break;
+                    }
+                    Ok(read) => decoder.extend(&chunk[..read]),
+                }
+
+                loop {
+                    match decoder.next_message() {
+                        Ok(None) => break,
+                        Ok(Some(Message::Complete { id, outcome })) => {
+                            pending.push(id, outcome);
+                            if deadline.is_none() {
+                                deadline = Some(tokio::time::Instant::now() + linger);
+                            }
+                        }
+                        Ok(Some(Message::Dispatch { .. })) => {
+                            tracing::error!("python child sent a dispatch frame");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "python child sent an unreadable frame");
+                            pending.flush(&pool, &inflight).await;
+                            return;
+                        }
+                    }
+                }
+
+                if pending.len() >= batch {
+                    pending.flush(&pool, &inflight).await;
+                    deadline = None;
+                }
+            }
+            () = timer => {
+                pending.flush(&pool, &inflight).await;
+                deadline = None;
+            }
+        }
     }
-    capacity.release();
+
+    pending.flush(&pool, &inflight).await;
 }
 
 fn spawn_child(config: &Config, socket: &Path) -> std::io::Result<Child> {

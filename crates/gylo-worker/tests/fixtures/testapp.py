@@ -1,6 +1,13 @@
+import asyncio
+
 import gylo
 
 app = gylo.Gylo()
+
+
+@app.task(name="slow")
+async def slow() -> None:
+    await asyncio.sleep(3)
 
 
 @app.task(name="ok")
