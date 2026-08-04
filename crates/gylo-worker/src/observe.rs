@@ -24,19 +24,18 @@ pub const BLOCKED: &str = "gylo_queue_blocked";
 pub const RUNNING: &str = "gylo_queue_running";
 pub const FLUSH_SECONDS: &str = "gylo_completion_flush_seconds";
 
-pub fn leased(queue: &str, count: usize) {
-    counter!(LEASED, "queue" => queue.to_owned()).increment(count as u64);
+pub fn leased(count: usize) {
+    counter!(LEASED).increment(count as u64);
 }
 
-pub fn settled(queue: &str, completed: usize, retried: usize, discarded: usize) {
-    let queue = queue.to_owned();
-    counter!(COMPLETED, "queue" => queue.clone()).increment(completed as u64);
-    counter!(RETRIED, "queue" => queue.clone()).increment(retried as u64);
-    counter!(DISCARDED, "queue" => queue).increment(discarded as u64);
+pub fn settled(completed: usize, retried: usize, discarded: usize) {
+    counter!(COMPLETED).increment(completed as u64);
+    counter!(RETRIED).increment(retried as u64);
+    counter!(DISCARDED).increment(discarded as u64);
 }
 
-pub fn flushed(queue: &str, seconds: f64) {
-    histogram!(FLUSH_SECONDS, "queue" => queue.to_owned()).record(seconds);
+pub fn flushed(seconds: f64) {
+    histogram!(FLUSH_SECONDS).record(seconds);
 }
 
 pub fn reclaimed(released: i64, exhausted: i64) {

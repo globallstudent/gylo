@@ -113,7 +113,7 @@ const FETCH: &str = "
                COALESCE(a.running, 0) AS already
         FROM gylo_job j
         LEFT JOIN active a ON a.concurrency_key = j.concurrency_key
-        WHERE j.state = 'available' AND j.queue = $1 AND j.scheduled_at <= now()
+        WHERE j.state = 'available' AND j.queue = ANY($1) AND j.scheduled_at <= now()
           AND (j.concurrency_key IS NULL OR COALESCE(a.running, 0) < j.max_concurrency)
         ORDER BY j.priority, j.scheduled_at, j.id
         LIMIT $2
@@ -510,15 +510,20 @@ pub async fn enqueue<'e, E: PgExecutor<'e>>(executor: E, job: &NewJob) -> Result
 /// locking and the batch is then ranked per key, because Postgres will not
 /// accept `FOR UPDATE` beside a window function — so the limit has to be
 /// applied in two passes rather than one.
+/// Leases across every named queue in one round trip.
+///
+/// Ordering is global rather than per queue, so a job's priority means the same
+/// thing wherever it was placed. Round-robin between queues would make a high
+/// priority in a quiet queue lose to a low one in a busy neighbour.
 pub async fn fetch<'e, E: PgExecutor<'e>>(
     executor: E,
-    queue: &str,
+    queues: &[String],
     limit: i64,
     lease: Duration,
     worker: Uuid,
 ) -> Result<Vec<Job>, Error> {
     let rows = sqlx::query(FETCH)
-        .bind(queue)
+        .bind(queues)
         .bind(limit)
         .bind(worker)
         .bind(lease.as_secs_f64())
@@ -852,4 +857,108 @@ pub async fn depth<'e, E: PgExecutor<'e>>(executor: E, queue: &str) -> Result<De
         blocked: row.get("blocked"),
         running: row.get("running"),
     })
+}
+
+/// One dead-lettered job, enough to decide whether to retry it.
+#[derive(Debug, Clone)]
+pub struct Discarded {
+    pub id: i64,
+    pub queue: String,
+    pub task: String,
+    pub attempt: i16,
+    pub finalized_at: Option<chrono::DateTime<Utc>>,
+    /// The last one only. The whole history is on the row for anyone who needs
+    /// it, and a listing that printed every attempt would bury the failure.
+    pub error: Option<String>,
+}
+
+const LIST_DISCARDED: &str = "
+    SELECT id, queue, task, attempt, finalized_at,
+           errors -> -1 ->> 'error' AS error
+    FROM gylo_job
+    WHERE state = 'discarded' AND ($1::text IS NULL OR queue = $1)
+    ORDER BY finalized_at DESC NULLS LAST, id DESC
+    LIMIT $2
+";
+
+pub async fn list_discarded<'e, E: PgExecutor<'e>>(
+    executor: E,
+    queue: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Discarded>, Error> {
+    let rows = sqlx::query(LIST_DISCARDED)
+        .bind(queue)
+        .bind(limit)
+        .fetch_all(executor)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Discarded {
+            id: row.get("id"),
+            queue: row.get("queue"),
+            task: row.get("task"),
+            attempt: row.get("attempt"),
+            finalized_at: row.get("finalized_at"),
+            error: row.get("error"),
+        })
+        .collect())
+}
+
+/// Returns dead-lettered jobs to the queue with their attempts reset.
+///
+/// The attempt counter has to go back to zero: a job is discarded precisely
+/// because it reached `max_attempts`, so requeueing without resetting produces
+/// a job that is immediately discarded again by the same rule.
+const RETRY_DISCARDED: &str = "
+    UPDATE gylo_job
+    SET state = 'available',
+        attempt = 0,
+        scheduled_at = now(),
+        locked_by = NULL,
+        lease_expires_at = NULL,
+        finalized_at = NULL
+    WHERE state = 'discarded'
+      AND ($1::bigint[] IS NULL OR id = ANY($1))
+      AND ($2::text IS NULL OR queue = $2)
+    RETURNING id
+";
+
+pub async fn retry_discarded<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: Option<&[i64]>,
+    queue: Option<&str>,
+) -> Result<Vec<i64>, Error> {
+    let rows = sqlx::query(RETRY_DISCARDED)
+        .bind(ids)
+        .bind(queue)
+        .fetch_all(executor)
+        .await?;
+    Ok(rows.into_iter().map(|row| row.get("id")).collect())
+}
+
+const PURGE_DISCARDED: &str = "
+    DELETE FROM gylo_job
+    WHERE state = 'discarded' AND ($1::text IS NULL OR queue = $1)
+";
+
+pub async fn purge_discarded<'e, E: PgExecutor<'e>>(
+    executor: E,
+    queue: Option<&str>,
+) -> Result<u64, Error> {
+    Ok(sqlx::query(PURGE_DISCARDED)
+        .bind(queue)
+        .execute(executor)
+        .await?
+        .rows_affected())
+}
+
+const QUEUE_NAMES: &str = "
+    SELECT DISTINCT queue FROM gylo_job
+    WHERE state IN ('available', 'running')
+    ORDER BY queue
+";
+
+pub async fn queues<'e, E: PgExecutor<'e>>(executor: E) -> Result<Vec<String>, Error> {
+    let rows = sqlx::query(QUEUE_NAMES).fetch_all(executor).await?;
+    Ok(rows.into_iter().map(|row| row.get("queue")).collect())
 }

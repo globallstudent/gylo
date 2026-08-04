@@ -52,7 +52,9 @@ pub enum Error {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub queue: String,
+    /// Queues this worker consumes, in no significant order: a job's priority
+    /// is compared across all of them at once rather than per queue.
+    pub queues: Vec<String>,
     /// Python child processes to run. Task code holds the interpreter lock, so
     /// one child uses one core however high `concurrency` goes; this is the
     /// setting that spends the rest of the machine.
@@ -100,7 +102,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            queue: "default".to_owned(),
+            queues: vec!["default".to_owned()],
             processes: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
             concurrency: 256,
             batch: 128,
@@ -131,6 +133,8 @@ impl Config {
     fn validate(&self) -> Result<(), Error> {
         let invalid = if self.app.is_empty() {
             Some("app must be set to a module:attribute path".to_owned())
+        } else if self.queues.is_empty() {
+            Some("at least one queue must be given".to_owned())
         } else if self.processes == 0 {
             Some("processes must be at least 1".to_owned())
         } else if self.concurrency == 0 {
@@ -251,7 +255,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
 
     let listening = tokio::spawn(listen(
         pool.clone(),
-        config.queue.clone(),
+        config.queues.clone(),
         Arc::clone(&wakeup),
         internal.clone(),
     ));
@@ -449,7 +453,13 @@ async fn session(
 /// Wakes the dispatcher when a job lands on its queue. Failures here are
 /// survivable: the dispatcher still polls, so losing the listener costs
 /// latency rather than correctness.
-async fn listen(pool: PgPool, queue: String, wakeup: Arc<Notify>, shutdown: CancellationToken) {
+async fn listen(
+    pool: PgPool,
+    queues: Vec<String>,
+    wakeup: Arc<Notify>,
+    shutdown: CancellationToken,
+) {
+    let queues: HashSet<String> = queues.into_iter().collect();
     loop {
         match sqlx::postgres::PgListener::connect_with(&pool).await {
             Ok(mut listener) => {
@@ -460,7 +470,7 @@ async fn listen(pool: PgPool, queue: String, wakeup: Arc<Notify>, shutdown: Canc
                         tokio::select! {
                             () = shutdown.cancelled() => return,
                             received = listener.recv() => match received {
-                                Ok(notification) if notification.payload() == queue => {
+                                Ok(notification) if queues.contains(notification.payload()) => {
                                     // every idle child, not one: a child that
                                     // is not waiting here is already fetching
                                     // and will see the job without being told
@@ -523,9 +533,11 @@ async fn recover(pool: PgPool, config: Config, shutdown: CancellationToken) {
             () = tokio::time::sleep(config.maintenance_interval) => {}
         }
 
-        match gylo_pg::depth(&pool, &config.queue).await {
-            Ok(depth) => observe::depth(&config.queue, depth),
-            Err(error) => tracing::warn!(%error, "sampling queue depth failed"),
+        for queue in &config.queues {
+            match gylo_pg::depth(&pool, queue).await {
+                Ok(depth) => observe::depth(queue, depth),
+                Err(error) => tracing::warn!(%error, %queue, "sampling queue depth failed"),
+            }
         }
 
         fire_due_schedules(&pool, config.cron_limit).await;
@@ -661,9 +673,9 @@ async fn dispatch(
         }
 
         let limit = config.batch.min(available as i64);
-        let jobs = match gylo_pg::fetch(&pool, &config.queue, limit, config.lease, worker).await {
+        let jobs = match gylo_pg::fetch(&pool, &config.queues, limit, config.lease, worker).await {
             Ok(jobs) => {
-                observe::leased(&config.queue, jobs.len());
+                observe::leased(jobs.len());
                 jobs
             }
             Err(error) => {
@@ -807,12 +819,11 @@ impl Pending {
         }
 
         observe::settled(
-            &config.queue,
             self.completed.len() + self.with_result.len(),
             self.retry.len(),
             self.terminal.len(),
         );
-        observe::flushed(&config.queue, started.elapsed().as_secs_f64());
+        observe::flushed(started.elapsed().as_secs_f64());
 
         let mut settled = Vec::with_capacity(self.len());
         settled.extend_from_slice(&self.completed);

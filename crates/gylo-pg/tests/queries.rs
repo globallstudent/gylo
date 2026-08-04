@@ -11,6 +11,10 @@ fn worker() -> Uuid {
     Uuid::new_v4()
 }
 
+fn queues(names: &str) -> Vec<String> {
+    names.split(',').map(str::to_owned).collect()
+}
+
 async fn state_of(pool: &PgPool, id: i64) -> String {
     sqlx::query("SELECT state::text FROM gylo_job WHERE id = $1")
         .bind(id)
@@ -26,7 +30,9 @@ async fn enqueued_job_comes_back_from_fetch(pool: PgPool) {
         .await
         .unwrap();
 
-    let jobs = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 10, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].id, id);
@@ -42,7 +48,9 @@ async fn fetch_honours_the_limit(pool: PgPool) {
         enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     }
 
-    let jobs = fetch(&pool, "default", 4, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 4, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(jobs.len(), 4);
 }
@@ -56,7 +64,9 @@ async fn delayed_job_is_not_yet_eligible(pool: PgPool) {
     .await
     .unwrap();
 
-    let jobs = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 10, LEASE, worker())
+        .await
+        .unwrap();
 
     assert!(jobs.is_empty());
 }
@@ -68,13 +78,13 @@ async fn fetch_is_scoped_to_one_queue(pool: PgPool) {
         .unwrap();
 
     assert!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        fetch(&pool, "emails", 10, LEASE, worker())
+        fetch(&pool, &queues("emails"), 10, LEASE, worker())
             .await
             .unwrap()
             .len(),
@@ -91,7 +101,9 @@ async fn lower_priority_number_runs_first(pool: PgPool) {
         .await
         .unwrap();
 
-    let jobs = fetch(&pool, "default", 2, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 2, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(jobs[0].id, high);
     assert_eq!(jobs[1].id, low);
@@ -106,10 +118,10 @@ async fn concurrent_fetches_never_hand_out_the_same_job(pool: PgPool) {
     let mut first = pool.begin().await.unwrap();
     let mut second = pool.begin().await.unwrap();
 
-    let claimed_first = fetch(&mut *first, "default", 10, LEASE, worker())
+    let claimed_first = fetch(&mut *first, &queues("default"), 10, LEASE, worker())
         .await
         .unwrap();
-    let claimed_second = fetch(&mut *second, "default", 10, LEASE, worker())
+    let claimed_second = fetch(&mut *second, &queues("default"), 10, LEASE, worker())
         .await
         .unwrap();
 
@@ -131,7 +143,9 @@ async fn concurrent_fetches_never_hand_out_the_same_job(pool: PgPool) {
 async fn discarding_records_the_attempt_history(pool: PgPool) {
     let me = worker();
     let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, me).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, me)
+        .await
+        .unwrap();
 
     assert!(discard(&pool, id, me, "ValueError: nope").await.unwrap());
     assert_eq!(state_of(&pool, id).await, "discarded");
@@ -154,7 +168,9 @@ async fn complete_many_finalises_the_whole_batch(pool: PgPool) {
         enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     }
     let me = worker();
-    let jobs = fetch(&pool, "default", 50, LEASE, me).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 50, LEASE, me)
+        .await
+        .unwrap();
     let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
 
     assert_eq!(complete_many(&pool, &ids, me).await.unwrap(), 50);
@@ -183,7 +199,9 @@ async fn complete_many_skips_jobs_nobody_leased(pool: PgPool) {
     let me = worker();
     let leased = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     let untouched = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, me).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, me)
+        .await
+        .unwrap();
 
     assert_eq!(
         complete_many(&pool, &[leased, untouched], me)
@@ -202,7 +220,9 @@ async fn discard_many_pairs_each_error_with_its_own_job(pool: PgPool) {
         enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     }
     let me = worker();
-    let jobs = fetch(&pool, "default", 5, LEASE, me).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 5, LEASE, me)
+        .await
+        .unwrap();
     let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
     let errors: Vec<String> = ids.iter().map(|id| format!("failure for {id}")).collect();
 
@@ -242,7 +262,9 @@ async fn scheduled_in(pool: &PgPool, id: i64) -> f64 {
 async fn a_failed_job_is_rescheduled_with_backoff(pool: PgPool) {
     let me = worker();
     let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, me).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, me)
+        .await
+        .unwrap();
 
     let retried = gylo_pg::retry_many(
         &pool,
@@ -265,7 +287,7 @@ async fn a_failed_job_is_rescheduled_with_backoff(pool: PgPool) {
         "first attempt should land within the jittered 50-100% band, got {delay}"
     );
     assert!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .is_empty(),
@@ -285,7 +307,9 @@ async fn backoff_grows_with_each_attempt(pool: PgPool) {
             .execute(&pool)
             .await
             .unwrap();
-        fetch(&pool, "default", 1, LEASE, me).await.unwrap();
+        fetch(&pool, &queues("default"), 1, LEASE, me)
+            .await
+            .unwrap();
         gylo_pg::retry_many(
             &pool,
             &[id],
@@ -341,7 +365,9 @@ async fn a_failure_on_the_last_attempt_is_dead_lettered(pool: PgPool) {
     let mut job = NewJob::new("t", Vec::new());
     job.max_attempts = 1;
     let id = enqueue(&pool, &job).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, me).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, me)
+        .await
+        .unwrap();
 
     let retried = gylo_pg::retry_many(
         &pool,
@@ -370,7 +396,9 @@ async fn expire_lease(pool: &PgPool, id: i64) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_expired_lease_returns_the_job_to_the_queue(pool: PgPool) {
     let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, worker())
+        .await
+        .unwrap();
     expire_lease(&pool, id).await;
 
     let reclaimed = reclaim_expired(&pool, 100).await.unwrap();
@@ -379,7 +407,7 @@ async fn an_expired_lease_returns_the_job_to_the_queue(pool: PgPool) {
     assert_eq!(reclaimed.exhausted, 0);
     assert_eq!(state_of(&pool, id).await, "available");
     assert_eq!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .len(),
@@ -391,7 +419,9 @@ async fn an_expired_lease_returns_the_job_to_the_queue(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_live_lease_is_left_alone(pool: PgPool) {
     let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(
         reclaim_expired(&pool, 100).await.unwrap(),
@@ -405,7 +435,9 @@ async fn a_job_out_of_attempts_is_dead_lettered_rather_than_retried(pool: PgPool
     let mut job = NewJob::new("t", Vec::new());
     job.max_attempts = 1;
     let id = enqueue(&pool, &job).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, worker())
+        .await
+        .unwrap();
     expire_lease(&pool, id).await;
 
     let reclaimed = reclaim_expired(&pool, 100).await.unwrap();
@@ -435,7 +467,9 @@ async fn reclaim_never_pushes_attempt_past_its_limit(pool: PgPool) {
     let id = enqueue(&pool, &job).await.unwrap();
 
     for expected in 1..=3 {
-        let jobs = fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+        let jobs = fetch(&pool, &queues("default"), 1, LEASE, worker())
+            .await
+            .unwrap();
         assert_eq!(jobs[0].attempt, expected);
         expire_lease(&pool, id).await;
         reclaim_expired(&pool, 100).await.unwrap();
@@ -453,7 +487,9 @@ async fn reclaim_honours_its_limit(pool: PgPool) {
     for _ in 0..10 {
         enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     }
-    let jobs = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 10, LEASE, worker())
+        .await
+        .unwrap();
     for job in &jobs {
         expire_lease(&pool, job.id).await;
     }
@@ -467,14 +503,14 @@ async fn a_leased_job_is_invisible_to_the_next_fetch(pool: PgPool) {
     enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
 
     assert_eq!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .len(),
         1
     );
     assert!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .is_empty()
@@ -486,7 +522,9 @@ async fn one_worker_cannot_finalise_a_job_another_holds(pool: PgPool) {
     let holder = worker();
     let stranger = worker();
     let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, holder).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, holder)
+        .await
+        .unwrap();
 
     assert_eq!(complete_many(&pool, &[id], stranger).await.unwrap(), 0);
     assert_eq!(
@@ -518,7 +556,9 @@ async fn one_worker_cannot_expire_or_extend_a_lease_another_holds(pool: PgPool) 
     let holder = worker();
     let stranger = worker();
     let id = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
-    fetch(&pool, "default", 1, LEASE, holder).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, holder)
+        .await
+        .unwrap();
 
     assert_eq!(
         gylo_pg::abandon_leases(&pool, &[id], stranger)
@@ -551,7 +591,9 @@ async fn a_key_admits_only_its_limit(pool: PgPool) {
         .unwrap();
     }
 
-    let jobs = fetch(&pool, "default", 100, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 100, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(
         jobs.len(),
@@ -573,7 +615,9 @@ async fn keys_are_limited_independently(pool: PgPool) {
         }
     }
 
-    let jobs = fetch(&pool, "default", 100, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 100, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(jobs.len(), 6, "two each from three keys");
 }
@@ -592,7 +636,9 @@ async fn unkeyed_jobs_are_never_held_back(pool: PgPool) {
         enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
     }
 
-    let jobs = fetch(&pool, "default", 100, LEASE, worker()).await.unwrap();
+    let jobs = fetch(&pool, &queues("default"), 100, LEASE, worker())
+        .await
+        .unwrap();
 
     assert_eq!(
         jobs.len(),
@@ -613,10 +659,12 @@ async fn a_finished_job_frees_its_slot(pool: PgPool) {
         .unwrap();
     }
 
-    let first = fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    let first = fetch(&pool, &queues("default"), 10, LEASE, me)
+        .await
+        .unwrap();
     assert_eq!(first.len(), 1);
     assert!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .is_empty(),
@@ -626,7 +674,7 @@ async fn a_finished_job_frees_its_slot(pool: PgPool) {
     complete_many(&pool, &[first[0].id], me).await.unwrap();
 
     assert_eq!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .len(),
@@ -648,10 +696,10 @@ async fn concurrent_workers_respect_the_same_key(pool: PgPool) {
 
     let mut first = pool.begin().await.unwrap();
     let mut second = pool.begin().await.unwrap();
-    let a = fetch(&mut *first, "default", 20, LEASE, worker())
+    let a = fetch(&mut *first, &queues("default"), 20, LEASE, worker())
         .await
         .unwrap();
-    let b = fetch(&mut *second, "default", 20, LEASE, worker())
+    let b = fetch(&mut *second, &queues("default"), 20, LEASE, worker())
         .await
         .unwrap();
     first.commit().await.unwrap();
@@ -705,13 +753,17 @@ async fn a_chain_releases_the_next_step_only_when_the_first_finishes(pool: PgPoo
     let me = worker();
     let ids = workflow_of(&pool, &["first", "second"]).await;
 
-    let claimed = fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    let claimed = fetch(&pool, &queues("default"), 10, LEASE, me)
+        .await
+        .unwrap();
     assert_eq!(claimed.len(), 1, "the second step is not runnable yet");
     assert_eq!(claimed[0].id, ids[0]);
 
     complete_many(&pool, &[ids[0]], me).await.unwrap();
 
-    let next = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    let next = fetch(&pool, &queues("default"), 10, LEASE, worker())
+        .await
+        .unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(
         next[0].id, ids[1],
@@ -753,10 +805,12 @@ async fn a_fan_in_waits_for_every_parent(pool: PgPool) {
             .unwrap();
     }
 
-    fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    fetch(&pool, &queues("default"), 10, LEASE, me)
+        .await
+        .unwrap();
     complete_many(&pool, &[parents[0]], me).await.unwrap();
     assert!(
-        fetch(&pool, "default", 10, LEASE, worker())
+        fetch(&pool, &queues("default"), 10, LEASE, worker())
             .await
             .unwrap()
             .is_empty(),
@@ -764,7 +818,9 @@ async fn a_fan_in_waits_for_every_parent(pool: PgPool) {
     );
 
     complete_many(&pool, &[parents[1]], me).await.unwrap();
-    let released = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    let released = fetch(&pool, &queues("default"), 10, LEASE, worker())
+        .await
+        .unwrap();
     assert_eq!(released.len(), 1);
     assert_eq!(released[0].id, callback);
 }
@@ -774,7 +830,9 @@ async fn a_dead_parent_cancels_everything_downstream(pool: PgPool) {
     let me = worker();
     let ids = workflow_of(&pool, &["first", "second", "third"]).await;
 
-    fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    fetch(&pool, &queues("default"), 10, LEASE, me)
+        .await
+        .unwrap();
     discard_many(&pool, &[ids[0]], &["boom".to_owned()], me)
         .await
         .unwrap();
@@ -808,7 +866,9 @@ async fn depth_separates_what_an_operator_can_act_on(pool: PgPool) {
         .await
         .unwrap();
 
-    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+    fetch(&pool, &queues("default"), 1, LEASE, worker())
+        .await
+        .unwrap();
 
     let depth = gylo_pg::depth(&pool, "default").await.unwrap();
 
@@ -823,4 +883,112 @@ async fn depth_separates_what_an_operator_can_act_on(pool: PgPool) {
         "a backlog gauge that counts jobs held for later, or parked on a \
          dependency, reports work nothing is waiting on"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn fetch_spans_every_named_queue_in_priority_order(pool: PgPool) {
+    let low = enqueue(
+        &pool,
+        &NewJob::new("low", Vec::new())
+            .on_queue("alpha")
+            .with_priority(9),
+    )
+    .await
+    .unwrap();
+    let high = enqueue(
+        &pool,
+        &NewJob::new("high", Vec::new())
+            .on_queue("beta")
+            .with_priority(0),
+    )
+    .await
+    .unwrap();
+    enqueue(&pool, &NewJob::new("other", Vec::new()).on_queue("gamma"))
+        .await
+        .unwrap();
+
+    let jobs = fetch(&pool, &queues("alpha,beta"), 10, LEASE, worker())
+        .await
+        .unwrap();
+
+    let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+    assert_eq!(
+        ids,
+        vec![high, low],
+        "priority must mean the same thing wherever a job was placed, or a \
+         high one in a quiet queue loses to a low one in a busy neighbour"
+    );
+}
+
+async fn dead_letter(pool: &PgPool, queue: &str, error: &str) -> i64 {
+    let mut job = NewJob::new("t", Vec::new()).on_queue(queue);
+    job.max_attempts = 1;
+    let id = enqueue(pool, &job).await.unwrap();
+    let holder = worker();
+    fetch(pool, &queues(queue), 10, LEASE, holder)
+        .await
+        .unwrap();
+    discard(pool, id, holder, error).await.unwrap();
+    id
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn dead_lettered_jobs_are_listed_with_their_last_error(pool: PgPool) {
+    let id = dead_letter(&pool, "payments", "ValueError: boom").await;
+    dead_letter(&pool, "reports", "other").await;
+
+    let failed = gylo_pg::list_discarded(&pool, Some("payments"), 20)
+        .await
+        .unwrap();
+
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id, id);
+    assert_eq!(failed[0].queue, "payments");
+    assert_eq!(failed[0].error.as_deref(), Some("ValueError: boom"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retrying_a_dead_lettered_job_resets_its_attempts(pool: PgPool) {
+    let id = dead_letter(&pool, "payments", "boom").await;
+
+    let retried = gylo_pg::retry_discarded(&pool, Some(&[id]), None)
+        .await
+        .unwrap();
+
+    assert_eq!(retried, vec![id]);
+    assert_eq!(state_of(&pool, id).await, "available");
+
+    let jobs = fetch(&pool, &queues("payments"), 10, LEASE, worker())
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "a job is dead-lettered for reaching max_attempts, so requeueing \
+         without resetting the counter produces one that cannot be fetched"
+    );
+    assert_eq!(jobs[0].attempt, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn purging_is_scoped_to_the_queue_asked_for(pool: PgPool) {
+    dead_letter(&pool, "payments", "boom").await;
+    let kept = dead_letter(&pool, "reports", "boom").await;
+
+    let removed = gylo_pg::purge_discarded(&pool, Some("payments"))
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 1);
+    assert_eq!(state_of(&pool, kept).await, "discarded");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn queues_lists_only_those_holding_live_work(pool: PgPool) {
+    enqueue(&pool, &NewJob::new("t", Vec::new()).on_queue("busy"))
+        .await
+        .unwrap();
+    dead_letter(&pool, "settled", "boom").await;
+
+    assert_eq!(gylo_pg::queues(&pool).await.unwrap(), vec!["busy"]);
 }

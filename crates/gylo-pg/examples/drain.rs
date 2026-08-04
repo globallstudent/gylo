@@ -35,16 +35,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         tx.commit().await?;
 
+        let queues = vec![QUEUE.to_owned()];
         let drained = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
         let mut tasks = Vec::new();
         for _ in 0..leasers {
             let pool = pool.clone();
             let drained = Arc::clone(&drained);
+            let queues = queues.clone();
             let worker = Uuid::new_v4();
             tasks.push(tokio::spawn(async move {
                 loop {
-                    let leased = fetch(&pool, QUEUE, batch, Duration::from_secs(30), worker)
+                    let leased = fetch(&pool, &queues, batch, Duration::from_secs(30), worker)
                         .await
                         .expect("leasing");
                     if leased.is_empty() {

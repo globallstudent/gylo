@@ -28,6 +28,46 @@ enum Command {
     Migrate,
     /// Run a worker until interrupted.
     Worker(Box<WorkerArgs>),
+    /// Show what each queue is holding.
+    Queue {
+        /// Only this queue. Every queue with work on it when unset.
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// Inspect and act on jobs that ran out of attempts.
+    Jobs {
+        #[command(subcommand)]
+        command: JobsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobsCommand {
+    /// List dead-lettered jobs, most recently failed first.
+    Failed {
+        #[arg(long)]
+        queue: Option<String>,
+
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    /// Return dead-lettered jobs to their queue with attempts reset.
+    Retry {
+        /// Job ids. Every dead-lettered job in scope when none are given.
+        ids: Vec<i64>,
+
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// Delete dead-lettered jobs for good.
+    Purge {
+        #[arg(long)]
+        queue: Option<String>,
+
+        /// Required, because this cannot be undone.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Boxed into its own type: inline, these fields make the `Worker` variant
@@ -39,8 +79,10 @@ struct WorkerArgs {
     #[arg(long, env = "GYLO_APP")]
     app: String,
 
-    #[arg(long, default_value = "default")]
-    queue: String,
+    /// Queues to consume. Repeat or comma-separate for several; a job's
+    /// priority is compared across all of them at once rather than per queue.
+    #[arg(long = "queue", default_value = "default", value_delimiter = ',')]
+    queues: Vec<String>,
 
     /// Python child processes to run. Defaults to the core count, since
     /// task code holds the interpreter lock and one child uses one core.
@@ -191,6 +233,78 @@ async fn serve_observability(
         .context("serving the metrics endpoint")
 }
 
+async fn show_queues(pool: &PgPool, queue: Option<String>) -> Result<()> {
+    let names = match queue {
+        Some(one) => vec![one],
+        None => gylo_pg::queues(pool).await.context("listing queues")?,
+    };
+    if names.is_empty() {
+        println!("no queue is holding anything");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:>9} {:>10} {:>9} {:>9}",
+        "queue", "ready", "scheduled", "blocked", "running"
+    );
+    for name in names {
+        let depth = gylo_pg::depth(pool, &name)
+            .await
+            .with_context(|| format!("reading the depth of {name}"))?;
+        println!(
+            "{:<20} {:>9} {:>10} {:>9} {:>9}",
+            name, depth.ready, depth.scheduled, depth.blocked, depth.running
+        );
+    }
+    Ok(())
+}
+
+async fn show_failed(pool: &PgPool, queue: Option<String>, limit: i64) -> Result<()> {
+    let failed = gylo_pg::list_discarded(pool, queue.as_deref(), limit)
+        .await
+        .context("listing dead-lettered jobs")?;
+    if failed.is_empty() {
+        println!("nothing has been dead-lettered");
+        return Ok(());
+    }
+
+    for job in failed {
+        let when = job.finalized_at.map_or_else(
+            || "-".to_owned(),
+            |at| at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        );
+        // one line each, since the point of the listing is to find the id
+        // worth looking at rather than to read the tracebacks
+        let error = job.error.unwrap_or_else(|| "-".to_owned());
+        let first = error.lines().next_back().unwrap_or("-");
+        println!(
+            "{:<10} {:<16} {:<24} attempt {:<4} {when}  {first}",
+            job.id, job.queue, job.task, job.attempt
+        );
+    }
+    Ok(())
+}
+
+async fn retry_failed(pool: &PgPool, ids: Vec<i64>, queue: Option<String>) -> Result<()> {
+    let selected = (!ids.is_empty()).then_some(ids);
+    let retried = gylo_pg::retry_discarded(pool, selected.as_deref(), queue.as_deref())
+        .await
+        .context("returning dead-lettered jobs to their queue")?;
+    println!("{} job(s) queued again", retried.len());
+    Ok(())
+}
+
+async fn purge_failed(pool: &PgPool, queue: Option<String>, confirmed: bool) -> Result<()> {
+    if !confirmed {
+        anyhow::bail!("pass --yes to delete dead-lettered jobs; this cannot be undone");
+    }
+    let removed = gylo_pg::purge_discarded(pool, queue.as_deref())
+        .await
+        .context("deleting dead-lettered jobs")?;
+    println!("{removed} job(s) deleted");
+    Ok(())
+}
+
 async fn connect(url: Option<String>, size: u32) -> Result<PgPool> {
     let url = url.context("set DATABASE_URL or pass --database-url")?;
     gylo_pg::connect(&url, size)
@@ -219,10 +333,22 @@ async fn main() -> Result<()> {
             println!("migrations applied");
             Ok(())
         }
+        Command::Queue { queue } => {
+            let pool = connect(cli.database_url, 2).await?;
+            show_queues(&pool, queue).await
+        }
+        Command::Jobs { command } => {
+            let pool = connect(cli.database_url, 2).await?;
+            match command {
+                JobsCommand::Failed { queue, limit } => show_failed(&pool, queue, limit).await,
+                JobsCommand::Retry { ids, queue } => retry_failed(&pool, ids, queue).await,
+                JobsCommand::Purge { queue, yes } => purge_failed(&pool, queue, yes).await,
+            }
+        }
         Command::Worker(args) => {
             let WorkerArgs {
                 app,
-                queue,
+                queues,
                 processes,
                 concurrency,
                 batch,
@@ -250,7 +376,7 @@ async fn main() -> Result<()> {
             let size = pool_size.unwrap_or(processes as u32 * 3 + 4);
             let pool = connect(cli.database_url, size).await?;
             let config = Config {
-                queue,
+                queues,
                 processes,
                 concurrency,
                 batch,
@@ -283,7 +409,7 @@ async fn main() -> Result<()> {
                 _ => None,
             };
 
-            tracing::info!(queue = %config.queue, "worker starting");
+            tracing::info!(queues = ?config.queues, "worker starting");
             let outcome = gylo_worker::run(pool, config, shutdown.clone())
                 .await
                 .context("running the worker");

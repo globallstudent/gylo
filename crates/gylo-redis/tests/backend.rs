@@ -192,6 +192,7 @@ async fn the_backend_refuses_what_it_cannot_do() {
         Feature::KeyedConcurrency,
         Feature::UniqueJobs,
         Feature::Results,
+        Feature::Cron,
     ] {
         let refused = capabilities
             .require(&[feature])
@@ -201,7 +202,7 @@ async fn the_backend_refuses_what_it_cannot_do() {
     }
 
     capabilities
-        .require(&[Feature::Priorities, Feature::DelayedJobs, Feature::Cron])
+        .require(&[Feature::Priorities, Feature::DelayedJobs])
         .expect("these it can do");
 }
 
@@ -213,5 +214,66 @@ async fn durability_reflects_the_running_server() {
         !backend.capabilities().durable_acknowledgement,
         "this test server does not fsync every write, so the backend must \
          report that jobs it accepts can be lost"
+    );
+}
+
+#[tokio::test]
+async fn renewing_only_touches_leases_still_held() {
+    let mut backend = fresh("renew").await;
+    let held = backend
+        .enqueue(1, "t", Vec::new(), 0, 20, Duration::ZERO)
+        .await
+        .unwrap();
+    backend
+        .enqueue(2, "t", Vec::new(), 0, 20, Duration::ZERO)
+        .await
+        .unwrap();
+    backend.fetch(10, Duration::from_millis(50)).await.unwrap();
+    backend.complete(&[2]).await.unwrap();
+
+    let renewed = backend
+        .renew(&[held, 2], Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        renewed, 1,
+        "a job another worker has already taken back must not have its lease \
+         extended by the worker that lost it"
+    );
+}
+
+#[tokio::test]
+async fn abandoning_returns_work_without_waiting_for_expiry() {
+    let mut backend = fresh("abandon").await;
+    backend
+        .enqueue(1, "t", Vec::new(), 0, 20, Duration::ZERO)
+        .await
+        .unwrap();
+    let leased = backend.fetch(10, Duration::from_secs(600)).await.unwrap();
+    assert_eq!(leased.len(), 1);
+    assert_eq!(backend.depth().await.unwrap(), 0);
+
+    backend.abandon(&[1]).await.unwrap();
+
+    assert_eq!(backend.depth().await.unwrap(), 1);
+    assert_eq!(
+        backend
+            .fetch(10, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn cron_is_not_claimed_without_an_implementation() {
+    let backend = fresh("caps").await;
+
+    assert!(
+        !backend.capabilities().supports(Feature::Cron),
+        "declaring a feature this backend has no code for is worse than \
+         declaring none: the capability model exists to refuse, not to promise"
     );
 }

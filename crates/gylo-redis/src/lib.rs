@@ -105,6 +105,18 @@ const RECLAIM: &str = r"
     return #expired
 ";
 
+/// Extends only the leases still held, reporting how many that was.
+const RENEW: &str = r"
+    local renewed = 0
+    for i = 2, #ARGV do
+        if redis.call('ZSCORE', KEYS[1], ARGV[i]) then
+            redis.call('ZADD', KEYS[1], ARGV[1], ARGV[i])
+            renewed = renewed + 1
+        end
+    end
+    return renewed
+";
+
 fn now_millis() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -145,7 +157,9 @@ impl Backend {
             keyed_concurrency: false,
             workflows: false,
             durable_steps: false,
-            cron: true,
+            // schedules live in a table this backend does not have, and the
+            // leaderless fire is a conditional UPDATE with no equivalent here
+            cron: false,
             results: false,
         }
     }
@@ -257,6 +271,54 @@ impl Backend {
             .query_async::<()>(&mut self.conn)
             .await?;
         Ok(())
+    }
+
+    /// Pushes out the expiry of leases this worker still holds.
+    ///
+    /// Only ids currently leased are touched: a job another worker has since
+    /// reclaimed must not have its lease extended by the worker that lost it.
+    pub async fn renew(&mut self, ids: &[i64], lease: Duration) -> Result<u64, Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let expires = now_millis() + lease.as_millis() as f64;
+        let renewed: u64 = Script::new(RENEW)
+            .key(&self.keys.leased)
+            .arg(expires)
+            .arg(ids)
+            .invoke_async(&mut self.conn)
+            .await?;
+        Ok(renewed)
+    }
+
+    /// Returns leases to the ready set immediately, for a worker that knows it
+    /// is giving up rather than one that died and must be waited out.
+    pub async fn abandon(&mut self, ids: &[i64]) -> Result<u64, Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let (removed,): (u64,) = redis::pipe()
+            .atomic()
+            .zrem(&self.keys.leased, ids)
+            .query_async(&mut self.conn)
+            .await?;
+        let due = now_millis();
+        let mut ready = redis::pipe();
+        ready.atomic();
+        for id in ids {
+            ready.zadd(self.keys.ready(0), *id, due).ignore();
+        }
+        ready.query_async::<()>(&mut self.conn).await?;
+        Ok(removed)
+    }
+
+    /// Drops jobs that are out of attempts.
+    ///
+    /// Redis has no state column to move them to, so the row is simply gone.
+    /// Anything that needs to inspect what failed wants the Postgres backend,
+    /// which is why `results` is not a capability here.
+    pub async fn discard(&mut self, ids: &[i64]) -> Result<u64, Error> {
+        self.complete(ids).await
     }
 
     pub async fn reclaim_expired(&mut self, limit: usize) -> Result<u64, Error> {
