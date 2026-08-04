@@ -866,3 +866,152 @@ async fn synchronous_tasks_do_not_hold_the_event_loop(pool: PgPool) {
          unless a synchronous body leaves the loop free to dispatch the next"
     );
 }
+
+/// Two workers, as a deployment actually runs them: separate supervisors with
+/// their own lease identities, coordinating through nothing but the queue.
+async fn drain_with_two_workers(pool: &PgPool, log: &PathBuf, config: Config) {
+    let shutdown = CancellationToken::new();
+    let first = tokio::spawn(run(pool.clone(), config.clone(), shutdown.clone()));
+    let second = tokio::spawn(run(pool.clone(), config, shutdown.clone()));
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while unfinished(pool).await > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "two workers did not settle the queue within {TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    shutdown.cancel();
+    first.await.unwrap().expect("first worker failed");
+    second.await.unwrap().expect("second worker failed");
+    let _ = log;
+}
+
+fn runs_recorded(log: &PathBuf) -> Vec<i64> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_workers_on_one_queue_run_each_job_exactly_once(pool: PgPool) {
+    let log = effects_log();
+    let mut expected = Vec::new();
+    for n in 0..200 {
+        expected.push(n);
+        enqueue(&pool, &NewJob::new("mark", payload(&[n], &[])))
+            .await
+            .unwrap();
+    }
+
+    drain_with_two_workers(
+        &pool,
+        &log,
+        Config {
+            processes: 2,
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
+            ..config()
+        },
+    )
+    .await;
+
+    let mut ran = runs_recorded(&log);
+    ran.sort_unstable();
+    assert_eq!(
+        ran, expected,
+        "leasing is only exactly-once if two workers never hand the same row \
+         to both, and never leave one behind"
+    );
+}
+
+// Two overlapping fetches both read zero running for a key and each admits one.
+// Kept and ignored rather than deleted: the fix is a design decision with a
+// throughput cost, and this reproduction is the evidence for it. `--ignored`
+// runs them.
+#[ignore = "known: keyed concurrency admits over its limit when fetches overlap"]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_key_limits_concurrency_across_workers_not_just_within_one(pool: PgPool) {
+    let log = effects_log();
+    for n in 0..12 {
+        let mut job = NewJob::new("guarded", payload(&[n], &[]));
+        job.concurrency = Some(("tenant".to_owned(), 1));
+        enqueue(&pool, &job).await.unwrap();
+    }
+
+    drain_with_two_workers(
+        &pool,
+        &log,
+        Config {
+            processes: 2,
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
+            ..config()
+        },
+    )
+    .await;
+
+    // walking the bracket log rather than counting completions: every job
+    // finishing proves only that nothing was lost, which a limit that never
+    // applied would also satisfy
+    let recorded = std::fs::read_to_string(&log).unwrap_or_default();
+    let mut running = 0i32;
+    let mut peak = 0i32;
+    for line in recorded.lines() {
+        match line.split_whitespace().next() {
+            Some("start") => running += 1,
+            Some("end") => running -= 1,
+            _ => {}
+        }
+        peak = peak.max(running);
+    }
+
+    assert_eq!(
+        recorded.lines().filter(|l| l.starts_with("end")).count(),
+        12,
+        "every job should still finish"
+    );
+    assert_eq!(
+        peak, 1,
+        "a key that only holds inside one worker is not admission control: \
+         the tenant it protects is shared by every worker.\nlog was:\n{recorded}"
+    );
+}
+
+// Fails 7 runs in 10, worse than the two-worker case: this is one worker at its
+// default shape, one child per core.
+#[ignore = "known: keyed concurrency admits over its limit when fetches overlap"]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_key_limits_concurrency_within_one_worker(pool: PgPool) {
+    let log = effects_log();
+    for n in 0..12 {
+        let mut job = NewJob::new("guarded", payload(&[n], &[]));
+        job.concurrency = Some(("tenant".to_owned(), 1));
+        enqueue(&pool, &job).await.unwrap();
+    }
+
+    run_until_settled_with(
+        &pool,
+        Config {
+            processes: 4,
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
+            ..config()
+        },
+    )
+    .await;
+
+    let recorded = std::fs::read_to_string(&log).unwrap_or_default();
+    let mut running = 0i32;
+    let mut peak = 0i32;
+    for line in recorded.lines() {
+        match line.split_whitespace().next() {
+            Some("start") => running += 1,
+            Some("end") => running -= 1,
+            _ => {}
+        }
+        peak = peak.max(running);
+    }
+    assert_eq!(peak, 1, "one worker, four children");
+}

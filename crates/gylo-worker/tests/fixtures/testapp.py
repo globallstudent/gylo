@@ -144,3 +144,36 @@ def sync_rendezvous(wanted: int) -> None:
             return
         time.sleep(0.05)
     raise RuntimeError("synchronous bodies did not run concurrently")
+
+
+@app.task(name="mark")
+def mark(job: int) -> None:
+    """Appends once per execution, so a run can be counted rather than assumed.
+
+    Synchronous and opened per call: several worker processes append to this
+    concurrently, and a small O_APPEND write is atomic, which is what makes the
+    file a usable record of what actually ran.
+    """
+    with SIDE_EFFECTS.open("a") as log:
+        log.write(f"{job}\n")
+        log.flush()
+        os.fsync(log.fileno())
+
+
+@app.task(name="guarded")
+def guarded(job: int) -> None:
+    """Brackets its own execution so overlap can be detected, not inferred.
+
+    Appends are atomic and ordered, so the file is a usable serialisation of
+    what ran when, even with several worker processes writing to it.
+    """
+
+    def note(what: str) -> None:
+        with SIDE_EFFECTS.open("a") as log:
+            log.write(f"{what} {job}\n")
+            log.flush()
+            os.fsync(log.fileno())
+
+    note("start")
+    time.sleep(0.05)
+    note("end")
