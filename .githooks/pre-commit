@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+staged() {
+    git diff --cached --name-only --diff-filter=ACMR | grep -E "$1" || true
+}
+
+if [ -n "$(staged '\.rs$|(^|/)Cargo\.(toml|lock)$')" ]; then
+    echo "pre-commit: cargo fmt"
+    cargo fmt --check
+    echo "pre-commit: cargo clippy"
+    cargo clippy --all-targets --all-features -- -D warnings
+fi
+
+python_files="$(staged '\.py$')"
+if [ -n "$python_files" ]; then
+    if [ -x .venv/bin/ruff ]; then
+        ruff=.venv/bin/ruff
+    elif command -v ruff >/dev/null 2>&1; then
+        ruff=ruff
+    else
+        echo "pre-commit: ruff not found, install it with 'uv pip install ruff'" >&2
+        exit 1
+    fi
+    echo "pre-commit: ruff"
+    # shellcheck disable=SC2086
+    "$ruff" format --check $python_files
+    # shellcheck disable=SC2086
+    "$ruff" check $python_files
+fi

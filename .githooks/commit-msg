@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+message_file="$1"
+subject="$(sed -n '1p' "$message_file")"
+second_line="$(sed -n '2p' "$message_file")"
+
+fail() {
+    echo "commit-msg: $1" >&2
+    exit 1
+}
+
+case "$subject" in
+    '#'*|'') fail "subject line is empty" ;;
+esac
+
+[ "${#subject}" -le 72 ] || fail "subject is ${#subject} characters, keep it to 72"
+
+case "$subject" in
+    *.) fail "subject should not end with a period" ;;
+esac
+
+[ -z "$second_line" ] || fail "leave a blank line between the subject and the body"
+
+if grep -qiE '^(co-authored-by|generated with)' "$message_file"; then
+    fail "attribution trailers are not used in this project"
+fi
