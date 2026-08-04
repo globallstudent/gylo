@@ -69,11 +69,6 @@ async def nightly() -> None:
     pass
 
 
-@app.task(name="whoami", store_result=True)
-async def whoami() -> int:
-    return os.getpid()
-
-
 @app.task(name="adds", store_result=True)
 async def adds(left: int, right: int) -> dict[str, int]:
     return {"sum": left + right}
@@ -107,3 +102,21 @@ async def two_steps(ctx, marker: str) -> None:
         return charged
 
     await ctx.step("finish", finish)
+
+
+@app.task(name="rendezvous")
+async def rendezvous(wanted: int) -> None:
+    """Completes only once `wanted` children are running this at the same time.
+
+    A child limited to one job at a time cannot satisfy this alone, so the task
+    finishing at all is the evidence that dispatch reached separate processes.
+    """
+    with SIDE_EFFECTS.open("a") as log:
+        log.write(f"{os.getpid()}\n")
+
+    for _ in range(200):
+        arrived = set(SIDE_EFFECTS.read_text().split())
+        if len(arrived) >= wanted:
+            return
+        await asyncio.sleep(0.05)
+    raise RuntimeError(f"only {len(arrived)} of {wanted} children arrived")

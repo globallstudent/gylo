@@ -773,8 +773,9 @@ async fn required_features_are_checked_before_anything_starts(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_backlog_is_shared_across_children(pool: PgPool) {
-    for _ in 0..200 {
-        enqueue(&pool, &NewJob::new("whoami", payload(&[], &[])))
+    let log = effects_log();
+    for _ in 0..2 {
+        enqueue(&pool, &NewJob::new("rendezvous", payload(&[2], &[])))
             .await
             .unwrap();
     }
@@ -782,24 +783,25 @@ async fn a_backlog_is_shared_across_children(pool: PgPool) {
     run_until_settled_with(
         &pool,
         Config {
-            processes: 4,
+            processes: 2,
+            // one job per child, so both jobs can only be running at once if
+            // they are running in different children
+            concurrency: 1,
+            batch: 1,
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
             ..config()
         },
     )
     .await;
 
-    let rows = sqlx::query("SELECT result FROM gylo_job WHERE result IS NOT NULL")
-        .fetch_all(&pool)
+    let completed: i64 = sqlx::query("SELECT count(*) FROM gylo_job WHERE state = 'completed'")
+        .fetch_one(&pool)
         .await
-        .unwrap();
-    let ran_by: std::collections::HashSet<i64> = rows
-        .iter()
-        .map(|row| rmp_serde::from_slice(row.get::<Vec<u8>, _>(0).as_slice()).unwrap())
-        .collect();
-
-    assert_eq!(rows.len(), 200);
-    assert!(
-        ran_by.len() > 1,
-        "every job ran in one child, so the others were leasing nothing: {ran_by:?}"
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        completed, 2,
+        "the tasks wait for each other, so neither completes unless two \
+         children leased at the same time"
     );
 }
