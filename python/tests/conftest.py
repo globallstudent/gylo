@@ -17,3 +17,14 @@ async def conn():
         yield connection
     finally:
         await connection.close()
+
+
+@pytest.fixture
+async def pool():
+    created = await asyncpg.create_pool(DSN, min_size=1, max_size=4)
+    async with created.acquire() as conn:
+        await conn.execute("TRUNCATE gylo_job CASCADE")
+    try:
+        yield created
+    finally:
+        await created.close()
