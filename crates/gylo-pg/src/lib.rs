@@ -812,3 +812,44 @@ pub async fn steps_for<'e, E: PgExecutor<'e>>(
         .map(|row| Ok((row.try_get("name")?, row.try_get("result")?)))
         .collect()
 }
+
+/// What a queue is holding, split by what an operator can act on.
+///
+/// `available` alone is not a backlog: it also covers jobs deliberately held
+/// for later, and workflow jobs parked at `scheduled_at = 'infinity'` waiting
+/// on a dependency. Only `ready` is work nothing is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Depth {
+    pub ready: i64,
+    pub scheduled: i64,
+    pub blocked: i64,
+    pub running: i64,
+}
+
+const DEPTH: &str = "
+    SELECT
+        count(*) FILTER (
+            WHERE state = 'available' AND scheduled_at <= now()
+        ) AS ready,
+        count(*) FILTER (
+            WHERE state = 'available'
+              AND scheduled_at > now()
+              AND scheduled_at <> 'infinity'
+        ) AS scheduled,
+        count(*) FILTER (
+            WHERE state = 'available' AND scheduled_at = 'infinity'
+        ) AS blocked,
+        count(*) FILTER (WHERE state = 'running') AS running
+    FROM gylo_job
+    WHERE queue = $1
+";
+
+pub async fn depth<'e, E: PgExecutor<'e>>(executor: E, queue: &str) -> Result<Depth, Error> {
+    let row = sqlx::query(DEPTH).bind(queue).fetch_one(executor).await?;
+    Ok(Depth {
+        ready: row.get("ready"),
+        scheduled: row.get("scheduled"),
+        blocked: row.get("blocked"),
+        running: row.get("running"),
+    })
+}

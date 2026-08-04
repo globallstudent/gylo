@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod observe;
+
 use chrono::Utc;
 use gylo_core::{Decoder, Message, Outcome, Schedule, encode};
 use sqlx::PgPool;
@@ -255,6 +257,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
     ));
     let recovering = tokio::spawn(recover(pool.clone(), config.clone(), internal.clone()));
 
+    observe::children(config.processes);
     let mut children = tokio::task::JoinSet::new();
     for _ in 0..config.processes {
         children.spawn(supervise(
@@ -315,6 +318,7 @@ async fn supervise(
                     consecutive = 0;
                 }
                 consecutive += 1;
+                observe::child_restarted();
                 hand_back(&pool, &inflight, &config, worker).await;
 
                 if consecutive > config.max_restarts {
@@ -519,10 +523,16 @@ async fn recover(pool: PgPool, config: Config, shutdown: CancellationToken) {
             () = tokio::time::sleep(config.maintenance_interval) => {}
         }
 
+        match gylo_pg::depth(&pool, &config.queue).await {
+            Ok(depth) => observe::depth(&config.queue, depth),
+            Err(error) => tracing::warn!(%error, "sampling queue depth failed"),
+        }
+
         fire_due_schedules(&pool, config.cron_limit).await;
 
         match gylo_pg::reclaim_expired(&pool, config.reclaim_limit).await {
             Ok(reclaimed) if reclaimed != gylo_pg::Reclaimed::default() => {
+                observe::reclaimed(reclaimed.released, reclaimed.exhausted);
                 tracing::info!(
                     released = reclaimed.released,
                     exhausted = reclaimed.exhausted,
@@ -652,7 +662,10 @@ async fn dispatch(
 
         let limit = config.batch.min(available as i64);
         let jobs = match gylo_pg::fetch(&pool, &config.queue, limit, config.lease, worker).await {
-            Ok(jobs) => jobs,
+            Ok(jobs) => {
+                observe::leased(&config.queue, jobs.len());
+                jobs
+            }
             Err(error) => {
                 tracing::warn!(%error, "leasing jobs failed, retrying");
                 tokio::select! {
@@ -765,6 +778,7 @@ impl Pending {
         if self.len() == 0 {
             return;
         }
+        let started = tokio::time::Instant::now();
         if let Err(error) = gylo_pg::complete_many(pool, &self.completed, worker).await {
             tracing::error!(%error, jobs = self.completed.len(), "recording completions failed");
         }
@@ -791,6 +805,14 @@ impl Pending {
         {
             tracing::error!(%error, jobs = self.terminal.len(), "recording failures failed");
         }
+
+        observe::settled(
+            &config.queue,
+            self.completed.len() + self.with_result.len(),
+            self.retry.len(),
+            self.terminal.len(),
+        );
+        observe::flushed(&config.queue, started.elapsed().as_secs_f64());
 
         let mut settled = Vec::with_capacity(self.len());
         settled.extend_from_slice(&self.completed);

@@ -787,3 +787,40 @@ async fn a_dead_parent_cancels_everything_downstream(pool: PgPool) {
         "cancellation must reach the whole tail, not just the next step"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn depth_separates_what_an_operator_can_act_on(pool: PgPool) {
+    enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    enqueue(
+        &pool,
+        &NewJob::new("t", Vec::new()).delayed_by(Duration::from_secs(3600)),
+    )
+    .await
+    .unwrap();
+    let blocked = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    sqlx::query("UPDATE gylo_job SET scheduled_at = 'infinity' WHERE id = $1")
+        .bind(blocked)
+        .execute(&pool)
+        .await
+        .unwrap();
+    enqueue(&pool, &NewJob::new("t", Vec::new()).on_queue("elsewhere"))
+        .await
+        .unwrap();
+
+    fetch(&pool, "default", 1, LEASE, worker()).await.unwrap();
+
+    let depth = gylo_pg::depth(&pool, "default").await.unwrap();
+
+    assert_eq!(
+        depth,
+        gylo_pg::Depth {
+            ready: 1,
+            scheduled: 1,
+            blocked: 1,
+            running: 1,
+        },
+        "a backlog gauge that counts jobs held for later, or parked on a \
+         dependency, reports work nothing is waiting on"
+    );
+}

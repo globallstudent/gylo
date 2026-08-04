@@ -1,9 +1,13 @@
 use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use axum::Router;
+use axum::routing::get;
 use clap::{Parser, Subcommand};
 use gylo_worker::Config;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -23,54 +27,64 @@ enum Command {
     /// Apply any migrations the database is missing.
     Migrate,
     /// Run a worker until interrupted.
-    Worker {
-        /// `module:attribute` path to your Gylo app.
-        #[arg(long, env = "GYLO_APP")]
-        app: String,
+    Worker(Box<WorkerArgs>),
+}
 
-        #[arg(long, default_value = "default")]
-        queue: String,
+/// Boxed into its own type: inline, these fields make the `Worker` variant
+/// vastly larger than `Migrate`, so every `Command` would carry the worker's
+/// full configuration around.
+#[derive(clap::Args)]
+struct WorkerArgs {
+    /// `module:attribute` path to your Gylo app.
+    #[arg(long, env = "GYLO_APP")]
+    app: String,
 
-        /// Python child processes to run. Defaults to the core count, since
-        /// task code holds the interpreter lock and one child uses one core.
-        #[arg(long)]
-        processes: Option<usize>,
+    #[arg(long, default_value = "default")]
+    queue: String,
 
-        /// Jobs one Python child may have in flight at once.
-        #[arg(long, default_value_t = 256)]
-        concurrency: usize,
+    /// Python child processes to run. Defaults to the core count, since
+    /// task code holds the interpreter lock and one child uses one core.
+    #[arg(long)]
+    processes: Option<usize>,
 
-        /// Jobs leased per round trip.
-        #[arg(long, default_value_t = 128)]
-        batch: i64,
+    /// Jobs one Python child may have in flight at once.
+    #[arg(long, default_value_t = 256)]
+    concurrency: usize,
 
-        /// How long a lease is held before another worker may reclaim it.
-        #[arg(long, default_value = "30s")]
-        lease: humantime::Duration,
+    /// Jobs leased per round trip.
+    #[arg(long, default_value_t = 128)]
+    batch: i64,
 
-        /// How long to wait before polling again when the queue is empty.
-        /// Notifications normally arrive first, so this is a safety net.
-        #[arg(long, default_value = "200ms")]
-        poll_interval: humantime::Duration,
+    /// How long a lease is held before another worker may reclaim it.
+    #[arg(long, default_value = "30s")]
+    lease: humantime::Duration,
 
-        /// How often to renew held leases and reclaim abandoned ones. Must
-        /// stay well below the lease.
-        #[arg(long, default_value = "10s")]
-        maintenance_interval: humantime::Duration,
+    /// How long to wait before polling again when the queue is empty.
+    /// Notifications normally arrive first, so this is a safety net.
+    #[arg(long, default_value = "200ms")]
+    poll_interval: humantime::Duration,
 
-        /// Interpreter to run task code with. Defaults to the one beside this
-        /// executable, falling back to `python3` on PATH.
-        #[arg(long, env = "GYLO_PYTHON")]
-        python: Option<PathBuf>,
+    /// How often to renew held leases and reclaim abandoned ones. Must
+    /// stay well below the lease.
+    #[arg(long, default_value = "10s")]
+    maintenance_interval: humantime::Duration,
 
-        /// Value for the child's PYTHONPATH.
-        #[arg(long, env = "PYTHONPATH")]
-        python_path: Option<OsString>,
+    /// Interpreter to run task code with. Defaults to the one beside this
+    /// executable, falling back to `python3` on PATH.
+    #[arg(long, env = "GYLO_PYTHON")]
+    python: Option<PathBuf>,
 
-        /// Defaults to what the configured children can actually use.
-        #[arg(long)]
-        pool_size: Option<u32>,
-    },
+    /// Value for the child's PYTHONPATH.
+    #[arg(long, env = "PYTHONPATH")]
+    python_path: Option<OsString>,
+
+    /// Defaults to what the configured children can actually use.
+    #[arg(long)]
+    pool_size: Option<u32>,
+
+    /// Address to serve `/metrics` and `/healthz` on. Off when unset.
+    #[arg(long, env = "GYLO_OBSERVE_ADDRESS")]
+    observe: Option<SocketAddr>,
 }
 
 /// The interpreter that owns this installation.
@@ -144,6 +158,39 @@ impl StopSignals {
     }
 }
 
+/// Serves `/metrics` for Prometheus and `/healthz` for a container probe.
+///
+/// Health is deliberately shallow: it answers whether this process is alive
+/// and able to serve, not whether Postgres is reachable. A liveness probe that
+/// fails on a database blip restarts every worker at once, turning a recovery
+/// into an outage, and the queue depth metrics already say when work is not
+/// moving.
+async fn serve_observability(
+    address: SocketAddr,
+    prometheus: PrometheusHandle,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/metrics",
+            get(move || {
+                let rendered = prometheus.render();
+                async move { rendered }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("binding the metrics endpoint on {address}"))?;
+    tracing::info!(%address, "serving /metrics and /healthz");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await
+        .context("serving the metrics endpoint")
+}
+
 async fn connect(url: Option<String>, size: u32) -> Result<PgPool> {
     let url = url.context("set DATABASE_URL or pass --database-url")?;
     gylo_pg::connect(&url, size)
@@ -172,20 +219,31 @@ async fn main() -> Result<()> {
             println!("migrations applied");
             Ok(())
         }
-        Command::Worker {
-            app,
-            queue,
-            processes,
-            concurrency,
-            batch,
-            lease,
-            poll_interval,
-            maintenance_interval,
-            python,
-            python_path,
-            pool_size,
-        } => {
+        Command::Worker(args) => {
+            let WorkerArgs {
+                app,
+                queue,
+                processes,
+                concurrency,
+                batch,
+                lease,
+                poll_interval,
+                maintenance_interval,
+                python,
+                python_path,
+                pool_size,
+                observe,
+            } = *args;
             let mut signals = StopSignals::listen()?;
+            // installed before the worker runs so no metric is recorded into a
+            // registry that does not exist yet
+            let prometheus = observe
+                .map(|_| {
+                    PrometheusBuilder::new()
+                        .install_recorder()
+                        .context("installing the metrics recorder")
+                })
+                .transpose()?;
             let processes = processes.unwrap_or_else(|| Config::default().processes);
             // three at once per child — leasing, finalising, renewing — plus
             // the queue-wide listener and recovery
@@ -216,10 +274,26 @@ async fn main() -> Result<()> {
                 signal.cancel();
             });
 
+            let serving = match (observe, prometheus) {
+                (Some(address), Some(handle)) => Some(tokio::spawn(serve_observability(
+                    address,
+                    handle,
+                    shutdown.clone(),
+                ))),
+                _ => None,
+            };
+
             tracing::info!(queue = %config.queue, "worker starting");
-            gylo_worker::run(pool, config, shutdown)
+            let outcome = gylo_worker::run(pool, config, shutdown.clone())
                 .await
-                .context("running the worker")?;
+                .context("running the worker");
+            shutdown.cancel();
+            if let Some(serving) = serving
+                && let Ok(Err(error)) = serving.await
+            {
+                tracing::error!(%error, "metrics endpoint failed");
+            }
+            outcome?;
             tracing::info!("worker stopped");
             Ok(())
         }
