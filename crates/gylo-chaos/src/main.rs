@@ -232,8 +232,12 @@ async fn children_of(worker: &Child) -> Vec<u32> {
 async fn kill_all(pids: &[u32]) -> bool {
     let mut killed = false;
     for pid in pids {
+        // a pid that exited between listing and killing is the ordinary race
+        // with a worker respawning its children, not a fault; letting `kill`
+        // report it would put noise in the same stream as real failures
         killed |= Command::new("kill")
             .args(["-9", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
             .status()
             .await
             .map(|status| status.success())

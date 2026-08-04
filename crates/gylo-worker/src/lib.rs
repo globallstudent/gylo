@@ -51,8 +51,12 @@ pub enum Error {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub queue: String,
-    /// Jobs in flight in the child at once; also caps how far ahead of the
-    /// child the supervisor will lease.
+    /// Python child processes to run. Task code holds the interpreter lock, so
+    /// one child uses one core however high `concurrency` goes; this is the
+    /// setting that spends the rest of the machine.
+    pub processes: usize,
+    /// Jobs in flight in one child at once; also caps how far ahead of that
+    /// child its supervisor will lease.
     pub concurrency: usize,
     /// Jobs leased per round trip. Throughput keeps climbing well past the
     /// default, but every leased job is one that waits for lease expiry if the
@@ -95,6 +99,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             queue: "default".to_owned(),
+            processes: std::thread::available_parallelism().map_or(1, |cores| cores.get()),
             concurrency: 256,
             batch: 128,
             lease: Duration::from_secs(30),
@@ -124,6 +129,8 @@ impl Config {
     fn validate(&self) -> Result<(), Error> {
         let invalid = if self.app.is_empty() {
             Some("app must be set to a module:attribute path".to_owned())
+        } else if self.processes == 0 {
+            Some("processes must be at least 1".to_owned())
         } else if self.concurrency == 0 {
             Some("concurrency must be at least 1".to_owned())
         } else if self.batch < 1 {
@@ -235,17 +242,60 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
     config.validate()?;
     gylo_pg::CAPABILITIES.require(&config.requires)?;
 
-    let worker = Uuid::new_v4();
-    let inflight = Arc::new(InFlight::new(config.concurrency));
     let wakeup = Arc::new(Notify::new());
+    // cancelled on our own initiative when a child gives up for good, which
+    // the caller's token must not be, since it is theirs
+    let internal = shutdown.child_token();
 
     let listening = tokio::spawn(listen(
         pool.clone(),
         config.queue.clone(),
         Arc::clone(&wakeup),
-        shutdown.clone(),
+        internal.clone(),
     ));
-    let maintaining = tokio::spawn(maintain(
+    let recovering = tokio::spawn(recover(pool.clone(), config.clone(), internal.clone()));
+
+    let mut children = tokio::task::JoinSet::new();
+    for _ in 0..config.processes {
+        children.spawn(supervise(
+            pool.clone(),
+            config.clone(),
+            Arc::clone(&wakeup),
+            internal.clone(),
+        ));
+    }
+
+    let mut outcome = Ok(());
+    while let Some(joined) = children.join_next().await {
+        if let Ok(Err(error)) = joined
+            && outcome.is_ok()
+        {
+            // a child that cannot stay up stops the worker rather than leaving
+            // a process that looks healthy and runs at a fraction of capacity
+            outcome = Err(error);
+            internal.cancel();
+        }
+    }
+
+    listening.abort();
+    recovering.abort();
+    outcome
+}
+
+/// One Python child, restarted as needed, with its own lease identity.
+///
+/// Children coordinate through the queue and nothing else: each leases under
+/// its own id and `SKIP LOCKED` keeps them off each other's rows, so adding
+/// one costs a connection and no contention.
+async fn supervise(
+    pool: PgPool,
+    config: Config,
+    wakeup: Arc<Notify>,
+    shutdown: CancellationToken,
+) -> Result<(), Error> {
+    let worker = Uuid::new_v4();
+    let inflight = Arc::new(InFlight::new(config.concurrency));
+    let renewing = tokio::spawn(renew(
         pool.clone(),
         config.clone(),
         worker,
@@ -289,8 +339,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
         }
     }
 
-    listening.abort();
-    maintaining.abort();
+    renewing.abort();
     outcome
 }
 
@@ -408,7 +457,10 @@ async fn listen(pool: PgPool, queue: String, wakeup: Arc<Notify>, shutdown: Canc
                             () = shutdown.cancelled() => return,
                             received = listener.recv() => match received {
                                 Ok(notification) if notification.payload() == queue => {
-                                    wakeup.notify_one();
+                                    // every idle child, not one: a child that
+                                    // is not waiting here is already fetching
+                                    // and will see the job without being told
+                                    wakeup.notify_waiters();
                                 }
                                 Ok(_) => {}
                                 Err(error) => {
@@ -430,8 +482,8 @@ async fn listen(pool: PgPool, queue: String, wakeup: Arc<Notify>, shutdown: Canc
     }
 }
 
-/// Renewal and recovery share a cadence because both are bounded by the lease.
-async fn maintain(
+/// Keeps one child's leases alive while its jobs run.
+async fn renew(
     pool: PgPool,
     config: Config,
     worker: Uuid,
@@ -445,8 +497,26 @@ async fn maintain(
         }
 
         let held = inflight.snapshot();
+        if held.is_empty() {
+            continue;
+        }
         if let Err(error) = gylo_pg::renew_leases(&pool, &held, worker, config.lease).await {
             tracing::error!(%error, jobs = held.len(), "renewing leases failed");
+        }
+    }
+}
+
+/// Fires due schedules and recovers leases whose worker died.
+///
+/// Once per worker process rather than once per child: both are queue-wide, so
+/// running them per child would multiply the work without finding anything a
+/// single pass would miss. Shares the renewal cadence, being bounded by the
+/// same lease.
+async fn recover(pool: PgPool, config: Config, shutdown: CancellationToken) {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(config.maintenance_interval) => {}
         }
 
         fire_due_schedules(&pool, config.cron_limit).await;

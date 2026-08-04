@@ -31,7 +31,12 @@ enum Command {
         #[arg(long, default_value = "default")]
         queue: String,
 
-        /// Jobs the Python child may have in flight at once.
+        /// Python child processes to run. Defaults to the core count, since
+        /// task code holds the interpreter lock and one child uses one core.
+        #[arg(long)]
+        processes: Option<usize>,
+
+        /// Jobs one Python child may have in flight at once.
         #[arg(long, default_value_t = 256)]
         concurrency: usize,
 
@@ -61,8 +66,9 @@ enum Command {
         #[arg(long, env = "PYTHONPATH")]
         python_path: Option<OsString>,
 
-        #[arg(long, default_value_t = 8)]
-        pool_size: u32,
+        /// Defaults to what the configured children can actually use.
+        #[arg(long)]
+        pool_size: Option<u32>,
     },
 }
 
@@ -97,6 +103,7 @@ async fn main() -> Result<()> {
         Command::Worker {
             app,
             queue,
+            processes,
             concurrency,
             batch,
             lease,
@@ -106,9 +113,14 @@ async fn main() -> Result<()> {
             python_path,
             pool_size,
         } => {
-            let pool = connect(cli.database_url, pool_size).await?;
+            let processes = processes.unwrap_or_else(|| Config::default().processes);
+            // three at once per child — leasing, finalising, renewing — plus
+            // the queue-wide listener and recovery
+            let size = pool_size.unwrap_or(processes as u32 * 3 + 4);
+            let pool = connect(cli.database_url, size).await?;
             let config = Config {
                 queue,
+                processes,
                 concurrency,
                 batch,
                 lease: lease.into(),
