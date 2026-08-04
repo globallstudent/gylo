@@ -305,3 +305,92 @@ async def test_a_limit_without_a_key_is_rejected(conn):
 async def test_a_limit_below_one_is_rejected(conn):
     with pytest.raises(ValueError, match="at least 1"):
         compute.options(concurrency_key="t", max_concurrency=0)
+
+
+@app.task(name="step_a")
+async def step_a() -> None:
+    pass
+
+
+@app.task(name="step_b")
+async def step_b() -> None:
+    pass
+
+
+@app.task(name="step_c")
+async def step_c() -> None:
+    pass
+
+
+async def runnable(conn):
+    rows = await conn.fetch(
+        "SELECT task FROM gylo_job WHERE state = 'available' "
+        "AND scheduled_at <= now() ORDER BY task"
+    )
+    return [r["task"] for r in rows]
+
+
+async def test_a_chain_runs_one_step_at_a_time(conn):
+    ids = await gylo.chain(
+        step_a.signature(), step_b.signature(), step_c.signature()
+    ).enqueue(conn)
+
+    assert len(ids) == 3
+    assert await runnable(conn) == ["step_a"], "only the head starts out runnable"
+
+
+async def test_a_group_runs_everything_at_once(conn):
+    await gylo.group(step_a.signature(), step_b.signature()).enqueue(conn)
+
+    assert await runnable(conn) == ["step_a", "step_b"]
+
+
+async def test_a_chord_waits_for_every_branch(conn):
+    ids = await gylo.chord(
+        gylo.group(step_a.signature(), step_b.signature()), step_c.signature()
+    ).enqueue(conn)
+
+    assert await runnable(conn) == ["step_a", "step_b"]
+    callback = ids[-1]
+    pending = await conn.fetchval(
+        "SELECT pending_deps FROM gylo_job WHERE id = $1", callback
+    )
+    assert pending == 2, "the callback waits on both branches"
+
+
+async def test_edges_are_recorded(conn):
+    ids = await gylo.chain(step_a.signature(), step_b.signature()).enqueue(conn)
+
+    edges = await conn.fetch("SELECT parent, child FROM gylo_edge")
+    assert [(e["parent"], e["child"]) for e in edges] == [(ids[0], ids[1])]
+
+
+async def test_a_workflow_rolls_back_whole(conn):
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        async with conn.transaction():
+            await gylo.chain(step_a.signature(), step_b.signature()).enqueue(conn)
+            raise Boom
+
+    assert await count(conn) == 0
+
+
+async def test_an_empty_workflow_is_a_no_op(conn):
+    assert await gylo.group().enqueue(conn) == []
+    assert await count(conn) == 0
+
+
+async def test_a_chain_of_graphs_connects_leaves_to_roots(conn):
+    flow = gylo.chain(
+        gylo.group(step_a.signature(), step_b.signature()),
+        step_c.signature(),
+    )
+
+    ids = await flow.enqueue(conn)
+
+    pending = await conn.fetchval(
+        "SELECT pending_deps FROM gylo_job WHERE id = $1", ids[-1]
+    )
+    assert pending == 2, "step_c waits on both members of the group"

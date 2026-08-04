@@ -663,3 +663,127 @@ async fn concurrent_workers_respect_the_same_key(pool: PgPool) {
         a.len() + b.len()
     );
 }
+
+async fn workflow_of(pool: &PgPool, tasks: &[&str]) -> Vec<i64> {
+    let workflow: i64 = sqlx::query("INSERT INTO gylo_workflow DEFAULT VALUES RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get(0);
+    let mut ids = Vec::new();
+    for (index, task) in tasks.iter().enumerate() {
+        let pending = i32::from(index > 0);
+        let id: i64 = sqlx::query(
+            "INSERT INTO gylo_job (workflow_id, queue, task, payload, pending_deps, scheduled_at)
+             VALUES ($1, 'default', $2, ''::bytea, $3,
+                     CASE WHEN $3 > 0 THEN 'infinity' ELSE now() END)
+             RETURNING id",
+        )
+        .bind(workflow)
+        .bind(task)
+        .bind(pending)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get(0);
+        if let Some(parent) = ids.last() {
+            sqlx::query("INSERT INTO gylo_edge (workflow_id, parent, child) VALUES ($1, $2, $3)")
+                .bind(workflow)
+                .bind(parent)
+                .bind(id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        ids.push(id);
+    }
+    ids
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_chain_releases_the_next_step_only_when_the_first_finishes(pool: PgPool) {
+    let me = worker();
+    let ids = workflow_of(&pool, &["first", "second"]).await;
+
+    let claimed = fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    assert_eq!(claimed.len(), 1, "the second step is not runnable yet");
+    assert_eq!(claimed[0].id, ids[0]);
+
+    complete_many(&pool, &[ids[0]], me).await.unwrap();
+
+    let next = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(
+        next[0].id, ids[1],
+        "finishing the first releases the second"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_fan_in_waits_for_every_parent(pool: PgPool) {
+    let me = worker();
+    let workflow: i64 = sqlx::query("INSERT INTO gylo_workflow DEFAULT VALUES RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    let mut parents = Vec::new();
+    for _ in 0..2 {
+        let id = enqueue(&pool, &NewJob::new("branch", Vec::new()))
+            .await
+            .unwrap();
+        parents.push(id);
+    }
+    let callback: i64 = sqlx::query(
+        "INSERT INTO gylo_job (workflow_id, queue, task, payload, pending_deps, scheduled_at)
+         VALUES ($1, 'default', 'join', ''::bytea, 2, 'infinity') RETURNING id",
+    )
+    .bind(workflow)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get(0);
+    for parent in &parents {
+        sqlx::query("INSERT INTO gylo_edge (workflow_id, parent, child) VALUES ($1, $2, $3)")
+            .bind(workflow)
+            .bind(parent)
+            .bind(callback)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    complete_many(&pool, &[parents[0]], me).await.unwrap();
+    assert!(
+        fetch(&pool, "default", 10, LEASE, worker())
+            .await
+            .unwrap()
+            .is_empty(),
+        "one parent finishing is not enough"
+    );
+
+    complete_many(&pool, &[parents[1]], me).await.unwrap();
+    let released = fetch(&pool, "default", 10, LEASE, worker()).await.unwrap();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].id, callback);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dead_parent_cancels_everything_downstream(pool: PgPool) {
+    let me = worker();
+    let ids = workflow_of(&pool, &["first", "second", "third"]).await;
+
+    fetch(&pool, "default", 10, LEASE, me).await.unwrap();
+    discard_many(&pool, &[ids[0]], &["boom".to_owned()], me)
+        .await
+        .unwrap();
+
+    assert_eq!(state_of(&pool, ids[0]).await, "discarded");
+    assert_eq!(state_of(&pool, ids[1]).await, "cancelled");
+    assert_eq!(
+        state_of(&pool, ids[2]).await,
+        "cancelled",
+        "cancellation must reach the whole tail, not just the next step"
+    );
+}

@@ -11,6 +11,7 @@ import msgspec
 
 from ._adapters import UnsupportedDriverError, adapter_for
 from ._steps import StepContext
+from ._workflow import Signature, Workflow, chain, chord, group
 
 __all__ = [
     "BoundTask",
@@ -19,11 +20,16 @@ __all__ = [
     "JobOutcome",
     "NoRetryError",
     "Options",
+    "Signature",
     "StepContext",
     "Task",
     "UnknownTaskError",
     "UnsupportedDriverError",
+    "Workflow",
     "cancel",
+    "chain",
+    "chord",
+    "group",
     "outcome",
 ]
 
@@ -144,6 +150,10 @@ class Task:
     ) -> None:
         return await self.options().enqueue_many(conn, calls)
 
+    def signature(self, *args: Any, **kwargs: Any) -> Signature:
+        """The task and these arguments, for placing in a workflow."""
+        return self.options().signature(*args, **kwargs)
+
 
 @dataclass(frozen=True, slots=True)
 class CronEntry:
@@ -222,6 +232,16 @@ class BoundTask:
         if self.options.unique is False:
             return row
         return (*row, _unique_key(self.task.name, self.options, args, kwargs))
+
+    def signature(self, *args: Any, **kwargs: Any) -> Signature:
+        """The task and these arguments, for placing in a workflow."""
+        return Signature(
+            task=self.task.name,
+            args=args,
+            kwargs=kwargs,
+            options=self.options,
+            durable=self.task.durable,
+        )
 
     async def enqueue(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
         """Insert the job, returning its id.

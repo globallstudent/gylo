@@ -125,14 +125,38 @@ const FETCH: &str = "
 ";
 
 const COMPLETE_WITH_RESULTS: &str = "
-    UPDATE gylo_job j
-    SET state = 'completed',
-        finalized_at = now(),
-        locked_by = NULL,
-        lease_expires_at = NULL,
-        result = v.result
-    FROM unnest($1::bigint[], $2::bytea[]) AS v(id, result)
-    WHERE j.id = v.id AND j.locked_by = $3 AND j.state = 'running'
+    WITH done AS (
+        UPDATE gylo_job j
+        SET state = 'completed',
+            finalized_at = now(),
+            locked_by = NULL,
+            lease_expires_at = NULL,
+            result = v.result
+        FROM unnest($1::bigint[], $2::bytea[]) AS v(id, result)
+        WHERE j.id = v.id AND j.locked_by = $3 AND j.state = 'running'
+        RETURNING j.id
+    ),
+    counted AS (
+        SELECT e.child, count(*) AS n
+        FROM gylo_edge e JOIN done ON done.id = e.parent
+        GROUP BY e.child
+    ),
+    released AS (
+        UPDATE gylo_job child
+        SET pending_deps = child.pending_deps - counted.n,
+            scheduled_at = CASE
+                WHEN child.pending_deps - counted.n = 0 THEN now()
+                ELSE child.scheduled_at
+            END
+        FROM counted
+        WHERE child.id = counted.child
+        RETURNING child.queue, child.pending_deps
+    ),
+    woken AS (
+        SELECT pg_notify('gylo_available', ready.queue)
+        FROM (SELECT DISTINCT queue FROM released WHERE pending_deps = 0) AS ready
+    )
+    SELECT (SELECT count(*) FROM done) AS settled, (SELECT count(*) FROM woken) AS woken
 ";
 
 const CANCEL: &str = "
@@ -150,27 +174,67 @@ const RESULT: &str = "
 ";
 
 const COMPLETE_MANY: &str = "
-    UPDATE gylo_job
-    SET state = 'completed',
-        finalized_at = now(),
-        locked_by = NULL,
-        lease_expires_at = NULL
-    WHERE id = ANY($1) AND locked_by = $2 AND state = 'running'
+    WITH done AS (
+        UPDATE gylo_job
+        SET state = 'completed',
+            finalized_at = now(),
+            locked_by = NULL,
+            lease_expires_at = NULL
+        WHERE id = ANY($1) AND locked_by = $2 AND state = 'running'
+        RETURNING id
+    ),
+    counted AS (
+        SELECT e.child, count(*) AS n
+        FROM gylo_edge e JOIN done ON done.id = e.parent
+        GROUP BY e.child
+    ),
+    released AS (
+        UPDATE gylo_job child
+        SET pending_deps = child.pending_deps - counted.n,
+            scheduled_at = CASE
+                WHEN child.pending_deps - counted.n = 0 THEN now()
+                ELSE child.scheduled_at
+            END
+        FROM counted
+        WHERE child.id = counted.child
+        RETURNING child.queue, child.pending_deps
+    ),
+    woken AS (
+        SELECT pg_notify('gylo_available', ready.queue)
+        FROM (SELECT DISTINCT queue FROM released WHERE pending_deps = 0) AS ready
+    )
+    SELECT (SELECT count(*) FROM done) AS settled, (SELECT count(*) FROM woken) AS woken
 ";
 
 const DISCARD_MANY: &str = "
-    UPDATE gylo_job j
-    SET state = 'discarded',
-        finalized_at = now(),
-        locked_by = NULL,
-        lease_expires_at = NULL,
-        errors = j.errors || jsonb_build_object(
-            'attempt', j.attempt,
-            'at', now(),
-            'error', v.error
-        )
-    FROM unnest($1::bigint[], $2::text[]) AS v(id, error)
-    WHERE j.id = v.id AND j.locked_by = $3 AND j.state = 'running'
+    WITH RECURSIVE dead AS (
+        UPDATE gylo_job j
+        SET state = 'discarded',
+            finalized_at = now(),
+            locked_by = NULL,
+            lease_expires_at = NULL,
+            errors = j.errors || jsonb_build_object(
+                'attempt', j.attempt,
+                'at', now(),
+                'error', v.error
+            )
+        FROM unnest($1::bigint[], $2::text[]) AS v(id, error)
+        WHERE j.id = v.id AND j.locked_by = $3 AND j.state = 'running'
+        RETURNING j.id
+    ),
+    walk AS (
+        SELECT e.child FROM gylo_edge e WHERE e.parent IN (SELECT id FROM dead)
+        UNION
+        SELECT e.child FROM gylo_edge e JOIN walk ON e.parent = walk.child
+    ),
+    cancelled AS (
+        UPDATE gylo_job
+        SET state = 'cancelled', finalized_at = now()
+        WHERE id IN (SELECT child FROM walk) AND state = 'available'
+        RETURNING id
+    )
+    SELECT (SELECT count(*) FROM dead) AS settled,
+           (SELECT count(*) FROM cancelled) AS cancelled
 ";
 
 const DISCARD: &str = "
@@ -479,6 +543,11 @@ pub async fn discard<'e, E: PgExecutor<'e>>(
 
 /// Returns how many were still leased, and so actually finalised. One
 /// statement and one commit, rather than one of each per job.
+///
+/// Completing a job also releases whatever depended on it: dependants have
+/// their outstanding count decremented and, at zero, become runnable. Doing
+/// that in the same statement is what makes fan-in safe when several parents
+/// of one child finish at once.
 pub async fn complete_many<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
@@ -487,16 +556,20 @@ pub async fn complete_many<'e, E: PgExecutor<'e>>(
     if ids.is_empty() {
         return Ok(0);
     }
-    let result = sqlx::query(COMPLETE_MANY)
+    let row = sqlx::query(COMPLETE_MANY)
         .bind(ids)
         .bind(worker)
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
-    Ok(result.rows_affected())
+    Ok(row.try_get::<i64, _>("settled")? as u64)
 }
 
 /// Batched [`discard`]. `ids` and `errors` are zipped positionally, so they
 /// must be the same length.
+///
+/// Everything downstream of a dead job is cancelled, transitively. Without
+/// that, a failed step in a chain leaves the rest waiting on a parent that
+/// will never finish.
 pub async fn discard_many<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
@@ -507,13 +580,13 @@ pub async fn discard_many<'e, E: PgExecutor<'e>>(
     if ids.is_empty() {
         return Ok(0);
     }
-    let result = sqlx::query(DISCARD_MANY)
+    let row = sqlx::query(DISCARD_MANY)
         .bind(ids)
         .bind(errors)
         .bind(worker)
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
-    Ok(result.rows_affected())
+    Ok(row.try_get::<i64, _>("settled")? as u64)
 }
 
 const UPSERT_CRON: &str = "
@@ -650,13 +723,13 @@ pub async fn complete_many_with_results<'e, E: PgExecutor<'e>>(
     if ids.is_empty() {
         return Ok(0);
     }
-    let result = sqlx::query(COMPLETE_WITH_RESULTS)
+    let row = sqlx::query(COMPLETE_WITH_RESULTS)
         .bind(ids)
         .bind(results)
         .bind(worker)
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
-    Ok(result.rows_affected())
+    Ok(row.try_get::<i64, _>("settled")? as u64)
 }
 
 /// Cancels jobs that have not started, returning how many were still waiting.

@@ -63,6 +63,35 @@ def _statements(marks: list[str]) -> tuple[str, str, str, str, str]:
     )
 
 
+def _node_statement(numbered: bool) -> str:
+    """The insert for one workflow node.
+
+    A node with unmet dependencies is scheduled at infinity, which the ordinary
+    fetch predicate already excludes — so a blocked job needs no state of its
+    own and the hot query is untouched.
+    """
+    marks = (
+        [f"${n}" for n in range(1, len(_COLUMNS) + 3)]
+        if numbered
+        else ["%s"] * (len(_COLUMNS) + 2)
+    )
+    workflow, rest, pending = marks[0], marks[1 : len(_COLUMNS) + 1], marks[-1]
+    values = list(rest)
+    values[_DELAY] = (
+        f"CASE WHEN {pending} > 0 THEN 'infinity' "
+        f"ELSE now() + make_interval(secs => {rest[_DELAY]}) END"
+    )
+    columns = ", ".join(_COLUMNS)
+    return (
+        f"INSERT INTO gylo_job (workflow_id, {columns}, pending_deps) "
+        f"VALUES ({workflow}, {', '.join(values)}, {pending}) RETURNING id"
+    )
+
+
+_NEW_WORKFLOW = "INSERT INTO gylo_workflow DEFAULT VALUES RETURNING id"
+_NEW_EDGE = "INSERT INTO gylo_edge (workflow_id, parent, child) VALUES ($1, $2, $3)"
+
+
 class Adapter(Protocol):
     INSERT: str
     INSERT_UNIQUE: str
@@ -89,11 +118,18 @@ class Adapter(Protocol):
     @classmethod
     async def cancel(cls, conn: Any, job_ids: list[int]) -> int: ...
 
+    @classmethod
+    async def insert_workflow(
+        cls, conn: Any, nodes: list[tuple[Any, ...]], edges: list[tuple[int, int]]
+    ) -> list[int]: ...
+
 
 class AsyncpgAdapter:
     INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
         [f"${n}" for n in range(1, len(_COLUMNS) + 2)]
     )
+    INSERT_NODE = _node_statement(numbered=True)
+    NEW_EDGE = _NEW_EDGE
 
     @classmethod
     async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int:
@@ -123,11 +159,25 @@ class AsyncpgAdapter:
         tag = await conn.execute(cls.CANCEL, job_ids)
         return int(tag.rsplit(" ", 1)[-1])
 
+    @classmethod
+    async def insert_workflow(
+        cls, conn: Any, nodes: list[tuple[Any, ...]], edges: list[tuple[int, int]]
+    ) -> list[int]:
+        workflow = await conn.fetchval(_NEW_WORKFLOW)
+        ids = [await conn.fetchval(cls.INSERT_NODE, workflow, *node) for node in nodes]
+        if edges:
+            await conn.executemany(
+                cls.NEW_EDGE, [(workflow, ids[p], ids[c]) for p, c in edges]
+            )
+        return ids
+
 
 class PsycopgAdapter:
     INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
         ["%s"] * (len(_COLUMNS) + 2)
     )
+    INSERT_NODE = _node_statement(numbered=False)
+    NEW_EDGE = _NEW_EDGE.replace("$1", "%s").replace("$2", "%s").replace("$3", "%s")
 
     @classmethod
     async def insert(cls, conn: Any, params: tuple[Any, ...]) -> int:
@@ -168,6 +218,23 @@ class PsycopgAdapter:
         async with conn.cursor() as cursor:
             await cursor.execute(cls.CANCEL, (job_ids,))
             return cursor.rowcount
+
+    @classmethod
+    async def insert_workflow(
+        cls, conn: Any, nodes: list[tuple[Any, ...]], edges: list[tuple[int, int]]
+    ) -> list[int]:
+        async with conn.cursor() as cursor:
+            await cursor.execute(_NEW_WORKFLOW)
+            workflow = (await cursor.fetchone())[0]
+            ids = []
+            for node in nodes:
+                await cursor.execute(cls.INSERT_NODE, (workflow, *node))
+                ids.append((await cursor.fetchone())[0])
+            if edges:
+                await cursor.executemany(
+                    cls.NEW_EDGE, [(workflow, ids[p], ids[c]) for p, c in edges]
+                )
+        return ids
 
 
 _BY_MODULE: dict[str, type[Adapter]] = {
