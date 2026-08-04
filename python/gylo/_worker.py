@@ -18,7 +18,13 @@ from typing import Any
 import msgspec
 
 from . import Gylo, UnknownTaskError
-from ._protocol import Decoder, Dispatch, encode_failure, encode_success
+from ._protocol import (
+    Decoder,
+    Dispatch,
+    encode_failure,
+    encode_register,
+    encode_success,
+)
 
 READ_BYTES = 1 << 16
 _decode_payload = msgspec.msgpack.Decoder().decode
@@ -75,6 +81,9 @@ async def _execute(app: Gylo, message: Dispatch, writer: asyncio.StreamWriter) -
 
 async def serve(app: Gylo, socket: str) -> None:
     reader, writer = await asyncio.open_unix_connection(socket)
+    writer.write(encode_register([entry.as_wire() for entry in app.crons]))
+    await writer.drain()
+
     decoder = Decoder()
     running: set[asyncio.Task[None]] = set()
 

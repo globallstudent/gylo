@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use gylo_core::Job;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{PgExecutor, Row};
@@ -436,4 +437,125 @@ pub async fn discard_many<'e, E: PgExecutor<'e>>(
         .execute(executor)
         .await?;
     Ok(result.rows_affected())
+}
+
+const UPSERT_CRON: &str = "
+    INSERT INTO gylo_cron (name, queue, task, payload, expression, timezone, next_run_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (name) DO UPDATE SET
+        queue = EXCLUDED.queue,
+        task = EXCLUDED.task,
+        payload = EXCLUDED.payload,
+        expression = EXCLUDED.expression,
+        timezone = EXCLUDED.timezone,
+        next_run_at = CASE
+            WHEN gylo_cron.expression IS DISTINCT FROM EXCLUDED.expression
+              OR gylo_cron.timezone IS DISTINCT FROM EXCLUDED.timezone
+            THEN EXCLUDED.next_run_at
+            ELSE gylo_cron.next_run_at
+        END,
+        updated_at = now()
+";
+
+const DUE_CRON: &str = "
+    SELECT name, expression, timezone
+    FROM gylo_cron
+    WHERE NOT paused AND next_run_at <= now()
+    ORDER BY next_run_at
+    LIMIT $1
+";
+
+const FIRE_CRON: &str = "
+    WITH won AS (
+        UPDATE gylo_cron
+        SET next_run_at = $2, last_run_at = now()
+        WHERE name = $1 AND NOT paused AND next_run_at <= now()
+        RETURNING queue, task, payload
+    )
+    INSERT INTO gylo_job (queue, task, payload)
+    SELECT queue, task, payload FROM won
+    RETURNING id
+";
+
+/// A schedule registered by the tasks a worker loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CronEntry {
+    pub name: String,
+    pub queue: String,
+    pub task: String,
+    pub payload: Vec<u8>,
+    pub expression: String,
+    pub timezone: String,
+}
+
+/// A schedule that has come due, with what it needs to compute the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueCron {
+    pub name: String,
+    pub expression: String,
+    pub timezone: String,
+}
+
+/// Records a schedule, leaving `next_run_at` alone unless the expression or
+/// zone actually changed, and never touching `paused`.
+///
+/// Both matter across a restart: resetting the clock on every boot would let a
+/// frequently-restarted fleet skip runs, and clearing `paused` would undo an
+/// operator every time someone deploys.
+pub async fn upsert_cron<'e, E: PgExecutor<'e>>(
+    executor: E,
+    entry: &CronEntry,
+    next_run_at: DateTime<Utc>,
+) -> Result<(), Error> {
+    sqlx::query(UPSERT_CRON)
+        .bind(&entry.name)
+        .bind(&entry.queue)
+        .bind(&entry.task)
+        .bind(&entry.payload)
+        .bind(&entry.expression)
+        .bind(&entry.timezone)
+        .bind(next_run_at)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+pub async fn due_cron<'e, E: PgExecutor<'e>>(
+    executor: E,
+    limit: i64,
+) -> Result<Vec<DueCron>, Error> {
+    let rows = sqlx::query(DUE_CRON)
+        .bind(limit)
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(DueCron {
+                name: row.try_get("name")?,
+                expression: row.try_get("expression")?,
+                timezone: row.try_get("timezone")?,
+            })
+        })
+        .collect()
+}
+
+/// Advances the schedule and enqueues its job in one statement, returning the
+/// job id if this caller was the one that won the row.
+///
+/// Exactly-once comes from the row lock Postgres takes for the `UPDATE`: only
+/// one caller can match `next_run_at <= now()` before it moves. No leader
+/// election sits on top of this; see ADR 0007.
+pub async fn fire_cron<'e, E: PgExecutor<'e>>(
+    executor: E,
+    name: &str,
+    next_run_at: DateTime<Utc>,
+) -> Result<Option<i64>, Error> {
+    let row = sqlx::query(FIRE_CRON)
+        .bind(name)
+        .bind(next_run_at)
+        .fetch_optional(executor)
+        .await?;
+    row.map(|row| row.try_get("id"))
+        .transpose()
+        .map_err(Error::from)
 }

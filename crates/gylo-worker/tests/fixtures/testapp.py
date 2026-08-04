@@ -55,3 +55,13 @@ async def fatal() -> None:
 @app.task(name="refused")
 async def refused() -> None:
     raise gylo.NoRetryError("give up immediately")
+
+
+@app.cron("* * * * * *", name="every_second", queue="beat")
+async def every_second() -> None:
+    pass
+
+
+@app.cron("0 3 * * *", name="nightly", timezone="Europe/London")
+async def nightly() -> None:
+    pass

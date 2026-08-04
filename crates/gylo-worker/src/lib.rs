@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gylo_core::{Decoder, Message, Outcome, encode};
+use chrono::Utc;
+use gylo_core::{Decoder, Message, Outcome, Schedule, encode};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -75,6 +76,8 @@ pub struct Config {
     /// session that stayed healthy resets the count, so this only catches a
     /// child that cannot stay up at all — usually a misconfigured `app`.
     pub max_restarts: u32,
+    /// Schedules examined per maintenance tick.
+    pub cron_limit: i64,
     pub python: PathBuf,
     /// `module:attribute` path to the user's app object.
     pub app: String,
@@ -96,6 +99,7 @@ impl Default for Config {
             retry_base: Duration::from_secs(1),
             retry_cap: Duration::from_secs(3600),
             max_restarts: 8,
+            cron_limit: 100,
             python: PathBuf::from("python3"),
             app: String::new(),
             python_path: None,
@@ -422,6 +426,8 @@ async fn maintain(
             tracing::error!(%error, jobs = held.len(), "renewing leases failed");
         }
 
+        fire_due_schedules(&pool, config.cron_limit).await;
+
         match gylo_pg::reclaim_expired(&pool, config.reclaim_limit).await {
             Ok(reclaimed) if reclaimed != gylo_pg::Reclaimed::default() => {
                 tracing::info!(
@@ -432,6 +438,70 @@ async fn maintain(
             }
             Ok(_) => {}
             Err(error) => tracing::error!(%error, "reclaiming abandoned leases failed"),
+        }
+    }
+}
+
+/// Records the schedules a child declared. A bad expression disables that one
+/// schedule loudly rather than stopping the worker, since the rest of its tasks
+/// are unaffected.
+async fn register_schedules(pool: &PgPool, entries: &[gylo_core::CronRegistration]) {
+    let now = Utc::now();
+    for entry in entries {
+        let schedule = match Schedule::parse(&entry.expression, &entry.timezone) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                tracing::error!(schedule = %entry.name, %error, "schedule not registered");
+                continue;
+            }
+        };
+        let next = match schedule.next_after(now) {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::error!(schedule = %entry.name, %error, "schedule has no next run");
+                continue;
+            }
+        };
+        let record = gylo_pg::CronEntry {
+            name: entry.name.clone(),
+            queue: entry.queue.clone(),
+            task: entry.task.clone(),
+            payload: entry.payload.clone(),
+            expression: entry.expression.clone(),
+            timezone: entry.timezone.clone(),
+        };
+        if let Err(error) = gylo_pg::upsert_cron(pool, &record, next).await {
+            tracing::error!(schedule = %entry.name, %error, "recording the schedule failed");
+        }
+    }
+}
+
+/// Enqueues whatever has come due. Every worker attempts this; the row lock
+/// Postgres takes for the update means only one of them wins each occurrence.
+async fn fire_due_schedules(pool: &PgPool, limit: i64) {
+    let due = match gylo_pg::due_cron(pool, limit).await {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::error!(%error, "looking for due schedules failed");
+            return;
+        }
+    };
+
+    let now = Utc::now();
+    for entry in due {
+        let next = match Schedule::parse(&entry.expression, &entry.timezone)
+            .and_then(|schedule| schedule.next_after(now))
+        {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::error!(schedule = %entry.name, %error, "cannot advance schedule");
+                continue;
+            }
+        };
+        match gylo_pg::fire_cron(pool, &entry.name, next).await {
+            Ok(Some(job)) => tracing::info!(schedule = %entry.name, job, "schedule fired"),
+            Ok(None) => {}
+            Err(error) => tracing::error!(schedule = %entry.name, %error, "firing failed"),
         }
     }
 }
@@ -623,6 +693,9 @@ async fn collect_completions(
                             if deadline.is_none() {
                                 deadline = Some(tokio::time::Instant::now() + linger);
                             }
+                        }
+                        Ok(Some(Message::Register(entries))) => {
+                            register_schedules(&pool, &entries).await;
                         }
                         Ok(Some(Message::Dispatch { .. })) => {
                             tracing::error!("python child sent a dispatch frame");

@@ -46,12 +46,17 @@ async fn state_of(pool: &PgPool, id: i64) -> String {
         .get(0)
 }
 
+/// Scoped to the queue the worker actually consumes. A schedule firing onto
+/// another queue is not work this worker will ever settle.
 async fn unfinished(pool: &PgPool) -> i64 {
-    sqlx::query("SELECT count(*) FROM gylo_job WHERE state IN ('available', 'running')")
-        .fetch_one(pool)
-        .await
-        .unwrap()
-        .get(0)
+    sqlx::query(
+        "SELECT count(*) FROM gylo_job
+         WHERE state IN ('available', 'running') AND queue = 'default'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get(0)
 }
 
 async fn run_until_settled(pool: &PgPool) {
@@ -384,6 +389,146 @@ async fn an_undecodable_payload_is_not_retried(pool: PgPool) {
         1,
         "a payload that cannot decode will never decode, so retrying it burns attempts for nothing"
     );
+}
+
+async fn schedules(pool: &PgPool) -> Vec<(String, String, String)> {
+    sqlx::query("SELECT name, expression, timezone FROM gylo_cron ORDER BY name")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+/// Runs until `done` holds, rather than for a fixed time: the child is a real
+/// interpreter and its startup dominates anything worth sleeping for.
+async fn run_until<F>(pool: &PgPool, config: Config, done: F)
+where
+    F: AsyncFn(&PgPool) -> bool,
+{
+    let shutdown = CancellationToken::new();
+    let worker = tokio::spawn(run(pool.clone(), config, shutdown.clone()));
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !done(pool).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition never held within {TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    shutdown.cancel();
+    worker
+        .await
+        .unwrap()
+        .expect("supervisor exited with an error");
+}
+
+async fn registered(pool: &PgPool) -> bool {
+    !schedules(pool).await.is_empty()
+}
+
+async fn beat_jobs(pool: &PgPool) -> i64 {
+    sqlx::query("SELECT count(*) FROM gylo_job WHERE queue = 'beat'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_child_registers_its_schedules_on_connect(pool: PgPool) {
+    run_until(
+        &pool,
+        Config {
+            maintenance_interval: Duration::from_secs(25),
+            ..config()
+        },
+        registered,
+    )
+    .await;
+
+    assert_eq!(
+        schedules(&pool).await,
+        vec![
+            (
+                "every_second".to_owned(),
+                "* * * * * *".to_owned(),
+                "UTC".to_owned()
+            ),
+            (
+                "nightly".to_owned(),
+                "0 3 * * *".to_owned(),
+                "Europe/London".to_owned()
+            ),
+        ]
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_due_schedule_enqueues_its_job(pool: PgPool) {
+    run_until(
+        &pool,
+        Config {
+            maintenance_interval: Duration::from_millis(100),
+            ..config()
+        },
+        async |pool| beat_jobs(pool).await >= 1,
+    )
+    .await;
+
+    assert!(beat_jobs(&pool).await >= 1);
+
+    let nightly: i64 = sqlx::query("SELECT count(*) FROM gylo_job WHERE task = 'nightly'")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(nightly, 0, "a nightly schedule is not due within the test");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn re_registering_keeps_the_pause_an_operator_set(pool: PgPool) {
+    run_until(
+        &pool,
+        Config {
+            maintenance_interval: Duration::from_secs(25),
+            ..config()
+        },
+        registered,
+    )
+    .await;
+    sqlx::query("UPDATE gylo_cron SET paused = true WHERE name = 'every_second'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let shutdown = CancellationToken::new();
+    let worker = tokio::spawn(run(
+        pool.clone(),
+        Config {
+            maintenance_interval: Duration::from_millis(100),
+            ..config()
+        },
+        shutdown.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    shutdown.cancel();
+    let _ = worker.await;
+
+    let paused: bool = sqlx::query("SELECT paused FROM gylo_cron WHERE name = 'every_second'")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        paused,
+        "a deploy must not silently resume a paused schedule"
+    );
+
+    assert_eq!(beat_jobs(&pool).await, 0, "a paused schedule must not fire");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

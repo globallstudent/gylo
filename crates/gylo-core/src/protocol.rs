@@ -10,6 +10,7 @@
 //!
 //! dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
 //! complete = 0x01 || i64 job_id || u8 outcome || error_utf8
+//! register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
 //!
 //! outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
 //! ```
@@ -17,6 +18,7 @@
 const HEADER_BYTES: usize = 4;
 const KIND_DISPATCH: u8 = 0x00;
 const KIND_COMPLETE: u8 = 0x01;
+const KIND_REGISTER: u8 = 0x02;
 const OUTCOME_SUCCESS: u8 = 0x00;
 const OUTCOME_RETRY: u8 = 0x01;
 const OUTCOME_TERMINAL: u8 = 0x02;
@@ -37,8 +39,23 @@ pub enum Outcome {
     },
 }
 
+/// A schedule the child declared, sent once when it connects.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CronRegistration {
+    pub name: String,
+    pub queue: String,
+    pub task: String,
+    pub expression: String,
+    pub timezone: String,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
+    /// Schedules declared by the child, sent once on connect. Carried as
+    /// MessagePack rather than hand-framed: it is a variable-shaped structure
+    /// sent once per session, so the hot path's byte layout buys nothing here.
+    Register(Vec<CronRegistration>),
     Dispatch {
         id: i64,
         task: String,
@@ -64,6 +81,8 @@ pub enum ProtocolError {
     NotUtf8(&'static str),
     #[error("task name of {0} bytes exceeds the 65535 byte limit")]
     TaskNameTooLong(usize),
+    #[error("registration payload is malformed: {0}")]
+    BadRegistration(String),
 }
 
 /// Append `message` to `out` as a complete frame.
@@ -86,15 +105,25 @@ const DISPATCH_HEAD_BYTES: usize = 1 + 8 + 2;
 const COMPLETE_HEAD_BYTES: usize = 1 + 8 + 1;
 
 fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<(), ProtocolError> {
+    let registration;
     let body_len = match message {
+        Message::Register(entries) => {
+            registration = rmp_serde::to_vec(entries)
+                .map_err(|error| ProtocolError::BadRegistration(error.to_string()))?;
+            1 + registration.len()
+        }
         Message::Dispatch { task, payload, .. } => {
+            registration = Vec::new();
             u16::try_from(task.len()).map_err(|_| ProtocolError::TaskNameTooLong(task.len()))?;
             DISPATCH_HEAD_BYTES + task.len() + payload.len()
         }
-        Message::Complete { outcome, .. } => match outcome {
-            Outcome::Success => COMPLETE_HEAD_BYTES,
-            Outcome::Failure { error, .. } => COMPLETE_HEAD_BYTES + error.len(),
-        },
+        Message::Complete { outcome, .. } => {
+            registration = Vec::new();
+            match outcome {
+                Outcome::Success => COMPLETE_HEAD_BYTES,
+                Outcome::Failure { error, .. } => COMPLETE_HEAD_BYTES + error.len(),
+            }
+        }
     };
     if body_len > MAX_FRAME_BYTES {
         return Err(ProtocolError::FrameTooLarge(body_len));
@@ -105,6 +134,10 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
     out.extend_from_slice(&header.to_le_bytes());
 
     match message {
+        Message::Register(_) => {
+            out.push(KIND_REGISTER);
+            out.extend_from_slice(&registration);
+        }
         Message::Dispatch { id, task, payload } => {
             let name_len = u16::try_from(task.len())
                 .map_err(|_| ProtocolError::TaskNameTooLong(task.len()))?;
@@ -223,6 +256,9 @@ fn decode_body(body: &[u8]) -> Result<Message, ProtocolError> {
             };
             Ok(Message::Complete { id, outcome })
         }
+        KIND_REGISTER => rmp_serde::from_slice(rest)
+            .map(Message::Register)
+            .map_err(|error| ProtocolError::BadRegistration(error.to_string())),
         other => Err(ProtocolError::UnknownKind(other)),
     }
 }
@@ -247,6 +283,35 @@ mod tests {
             task: "billing.charge".to_owned(),
             payload: vec![0x93, 0x01, 0x02, 0x03],
         }
+    }
+
+    #[test]
+    fn registration_round_trips() {
+        let message = Message::Register(vec![CronRegistration {
+            name: "nightly".to_owned(),
+            queue: "default".to_owned(),
+            task: "reports.nightly".to_owned(),
+            expression: "0 3 * * *".to_owned(),
+            timezone: "Europe/London".to_owned(),
+            payload: vec![0x92, 0x90, 0x80],
+        }]);
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn an_empty_registration_round_trips() {
+        let message = Message::Register(Vec::new());
+        assert_eq!(round_trip(&message), message);
+    }
+
+    #[test]
+    fn a_corrupt_registration_body_is_rejected() {
+        let mut decoder = Decoder::new();
+        decoder.extend(&[3, 0, 0, 0, KIND_REGISTER, 0xC1, 0xC1]);
+        assert!(matches!(
+            decoder.next_message(),
+            Err(ProtocolError::BadRegistration(_))
+        ));
     }
 
     #[test]

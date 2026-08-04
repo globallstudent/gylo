@@ -2,8 +2,12 @@
 //! Python worker protocol.
 
 mod protocol;
+mod schedule;
 
-pub use protocol::{Decoder, MAX_FRAME_BYTES, Message, Outcome, ProtocolError, encode};
+pub use protocol::{
+    CronRegistration, Decoder, MAX_FRAME_BYTES, Message, Outcome, ProtocolError, encode,
+};
+pub use schedule::{Schedule, ScheduleError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {

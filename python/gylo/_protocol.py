@@ -7,6 +7,7 @@ Mirrors `crates/gylo-core/src/protocol.rs`; the two must change together.
 
     dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
     complete = 0x01 || i64 job_id || u8 outcome || error_utf8
+    register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
 
     outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
 """
@@ -16,9 +17,12 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+import msgspec
+
 HEADER_BYTES = 4
 KIND_DISPATCH = 0x00
 KIND_COMPLETE = 0x01
+KIND_REGISTER = 0x02
 OUTCOME_SUCCESS = 0x00
 OUTCOME_RETRY = 0x01
 OUTCOME_TERMINAL = 0x02
@@ -41,6 +45,12 @@ class Dispatch:
     id: int
     task: str
     payload: bytes
+
+
+def encode_register(entries: list[tuple[str, str, str, str, str, bytes]]) -> bytes:
+    """Frame the schedules this child declares, sent once on connect."""
+    body = bytes([KIND_REGISTER]) + msgspec.msgpack.encode(entries)
+    return _LENGTH.pack(len(body)) + body
 
 
 def encode_success(job_id: int) -> bytes:

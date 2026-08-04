@@ -13,6 +13,7 @@ from ._adapters import UnsupportedDriverError, adapter_for
 
 __all__ = [
     "BoundTask",
+    "CronEntry",
     "Gylo",
     "NoRetryError",
     "Options",
@@ -122,6 +123,28 @@ class Task:
 
 
 @dataclass(frozen=True, slots=True)
+class CronEntry:
+    """A schedule declared alongside a task."""
+
+    name: str
+    queue: str
+    task: str
+    expression: str
+    timezone: str
+    payload: bytes
+
+    def as_wire(self) -> tuple[str, str, str, str, str, bytes]:
+        return (
+            self.name,
+            self.queue,
+            self.task,
+            self.expression,
+            self.timezone,
+            self.payload,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Options:
     queue: str = DEFAULT_QUEUE
     priority: int = 0
@@ -205,10 +228,11 @@ class BoundTask:
 class Gylo:
     """Registry of the tasks a worker can run."""
 
-    __slots__ = ("_tasks",)
+    __slots__ = ("_crons", "_tasks")
 
     def __init__(self) -> None:
         self._tasks: dict[str, Task] = {}
+        self._crons: dict[str, CronEntry] = {}
 
     def task(
         self,
@@ -229,6 +253,46 @@ class Gylo:
             return task
 
         return register(fn) if fn is not None else register
+
+    def cron(
+        self,
+        expression: str,
+        *,
+        name: str | None = None,
+        timezone: str = "UTC",
+        queue: str = DEFAULT_QUEUE,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Register a task that also runs on a schedule.
+
+        The schedule travels to the supervisor when a worker starts, so the
+        code that defines it is the only place it is defined. Missed runs are
+        not backfilled: a schedule that came due while the fleet was down
+        advances to its next occurrence.
+        """
+
+        def register(func: Callable[..., Any]) -> Task:
+            task = self.task(func, name=name)
+            schedule_name = name or task.name
+            if schedule_name in self._crons:
+                raise ValueError(f"schedule {schedule_name!r} is already registered")
+            self._crons[schedule_name] = CronEntry(
+                name=schedule_name,
+                queue=queue,
+                task=task.name,
+                expression=expression,
+                timezone=timezone,
+                payload=_encode((tuple(args), kwargs or {})),
+            )
+            return task
+
+        return register
+
+    @property
+    def crons(self) -> tuple[CronEntry, ...]:
+        """Every schedule registered, in declaration order."""
+        return tuple(self._crons.values())
 
     def get(self, name: str) -> Task:
         try:
