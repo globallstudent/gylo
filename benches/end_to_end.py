@@ -161,6 +161,15 @@ LIBRARIES = [
         seed_arq,
         lambda: [str(ROOT / ".venv" / "bin" / "arq"), "arq_app.WorkerSettings"],
     ),
+    # arq's default is a rate cap rather than a resource limit — at most
+    # queue_read_limit jobs every poll_delay, which is 100 every 0.5s however
+    # idle the worker is. Reporting only that would describe the setting
+    # instead of the library, so it is measured opened up as well.
+    (
+        "arq (tuned)",
+        seed_arq,
+        lambda: [str(ROOT / ".venv" / "bin" / "arq"), "arq_tuned_app.WorkerSettings"],
+    ),
     (
         "taskiq",
         seed_taskiq,
