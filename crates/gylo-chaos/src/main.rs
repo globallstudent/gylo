@@ -107,12 +107,19 @@ impl Harness {
             .expect("spawning gylo worker")
     }
 
+    /// Scoped to the queue this harness drives. A schedule left in the database
+    /// by something else fires onto its own queue forever, and counting those
+    /// rows reports every scenario as a failure to settle while the jobs under
+    /// test all finished correctly.
     async fn unfinished(&self) -> i64 {
-        sqlx::query("SELECT count(*) FROM gylo_job WHERE state IN ('available','running')")
-            .fetch_one(&self.pool)
-            .await
-            .map(|row| row.get(0))
-            .unwrap_or(-1)
+        sqlx::query(
+            "SELECT count(*) FROM gylo_job
+             WHERE state IN ('available','running') AND queue = 'default'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(|row| row.get(0))
+        .unwrap_or(-1)
     }
 
     /// Waits until the worker has started making progress but has not finished,

@@ -805,3 +805,58 @@ async fn a_backlog_is_shared_across_children(pool: PgPool) {
          children leased at the same time"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_task_that_overruns_its_timeout_is_failed(pool: PgPool) {
+    let mut job = NewJob::new("hangs", Vec::new());
+    job.max_attempts = 1;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(
+        state_of(&pool, id).await,
+        "discarded",
+        "a job with no deadline holds its lease for as long as the worker \
+         lives, because maintenance keeps renewing it"
+    );
+    let errors: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    let rendered = errors[0]["error"].as_str().unwrap();
+    assert!(rendered.contains("TimeoutError"), "got {rendered}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn synchronous_tasks_do_not_hold_the_event_loop(pool: PgPool) {
+    let log = effects_log();
+    for _ in 0..2 {
+        enqueue(&pool, &NewJob::new("sync_rendezvous", payload(&[2], &[])))
+            .await
+            .unwrap();
+    }
+
+    run_until_settled_with(
+        &pool,
+        Config {
+            processes: 1,
+            env: vec![("GYLO_TEST_EFFECTS".into(), log.clone().into())],
+            ..config()
+        },
+    )
+    .await;
+
+    let completed: i64 = sqlx::query("SELECT count(*) FROM gylo_job WHERE state = 'completed'")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        completed, 2,
+        "these wait for each other inside one child, so neither finishes \
+         unless a synchronous body leaves the loop free to dispatch the next"
+    );
+}

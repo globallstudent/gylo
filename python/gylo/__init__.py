@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,6 +15,7 @@ from ._steps import StepContext
 from ._workflow import Signature, Workflow, chain, chord, group
 
 __all__ = [
+    "DEFAULT_TIMEOUT",
     "BoundTask",
     "CronEntry",
     "Gylo",
@@ -36,6 +38,17 @@ __all__ = [
 
 DEFAULT_QUEUE = "default"
 DEFAULT_MAX_ATTEMPTS = 20
+
+# A task with no deadline that stops making progress holds its lease for as
+# long as the worker lives, because maintenance keeps renewing it, and the
+# concurrency slot it occupies is never returned. A default that applies to
+# tasks whose author did not think about it is what keeps one wedged call from
+# taking a worker down to nothing.
+DEFAULT_TIMEOUT = 300.0
+
+# Distinguishes "no timeout given, take the app's" from an explicit None,
+# which means this task is allowed to run without one.
+_INHERIT: Any = object()
 
 _encode = msgspec.msgpack.Encoder().encode
 
@@ -63,10 +76,12 @@ class Task:
         "_app",
         "durable",
         "fn",
+        "is_async",
         "name",
         "no_retry_on",
         "retry_on",
         "store_result",
+        "timeout",
     )
 
     def __init__(
@@ -78,6 +93,7 @@ class Task:
         no_retry_on: tuple[type[BaseException], ...] = (),
         store_result: bool = False,
         durable: bool = False,
+        timeout: float | None = None,
     ) -> None:
         self._app = app
         self.name = name
@@ -86,6 +102,8 @@ class Task:
         self.no_retry_on = no_retry_on
         self.store_result = store_result
         self.durable = durable
+        self.timeout = timeout
+        self.is_async = inspect.iscoroutinefunction(fn)
 
     def should_retry(self, error: BaseException) -> bool:
         """Whether `error` earns another attempt.
@@ -305,12 +323,13 @@ class BoundTask:
 class Gylo:
     """Registry of the tasks a worker can run."""
 
-    __slots__ = ("_crons", "_pool", "_tasks")
+    __slots__ = ("_crons", "_pool", "_tasks", "default_timeout")
 
-    def __init__(self) -> None:
+    def __init__(self, *, default_timeout: float | None = DEFAULT_TIMEOUT) -> None:
         self._tasks: dict[str, Task] = {}
         self._crons: dict[str, CronEntry] = {}
         self._pool: Any = None
+        self.default_timeout = default_timeout
 
     def bind(self, pool: Any) -> None:
         """Attach a connection pool for `submit`.
@@ -337,6 +356,7 @@ class Gylo:
         no_retry_on: tuple[type[BaseException], ...] = (),
         store_result: bool = False,
         durable: bool = False,
+        timeout: float | None = _INHERIT,
     ) -> Any:
         """Register a function as a task, bare or called with arguments.
 
@@ -347,14 +367,30 @@ class Gylo:
         `store_result` keeps the return value for later retrieval. It is off by
         default because most jobs are run for their effects, and storing what
         nobody reads costs a write and a row that cannot be pruned.
+
+        `timeout` is seconds of wall clock, defaulting to the app's. `None`
+        lets the task run without a deadline, which hands back responsibility
+        for never wedging.
         """
 
         def register(func: Callable[..., Any]) -> Task:
             task_name = name or f"{func.__module__}.{func.__qualname__}"
             if task_name in self._tasks:
                 raise ValueError(f"task {task_name!r} is already registered")
+            if durable and not inspect.iscoroutinefunction(func):
+                raise TypeError(
+                    f"durable task {task_name!r} must be async: its step "
+                    f"context is awaited, and a synchronous body cannot"
+                )
             task = Task(
-                self, task_name, func, retry_on, no_retry_on, store_result, durable
+                self,
+                task_name,
+                func,
+                retry_on,
+                no_retry_on,
+                store_result,
+                durable,
+                self.default_timeout if timeout is _INHERIT else timeout,
             )
             self._tasks[task_name] = task
             return task

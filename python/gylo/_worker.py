@@ -10,14 +10,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
-import inspect
 import sys
 import traceback
 from typing import Any
 
 import msgspec
 
-from . import Gylo, UnknownTaskError
+from . import Gylo, Task, UnknownTaskError
 from ._protocol import (
     Decoder,
     Dispatch,
@@ -50,6 +49,31 @@ async def _fail(writer: asyncio.StreamWriter, job_id: int, *, retry: bool) -> No
     await writer.drain()
 
 
+async def _call(
+    task: Task,
+    context: StepContext | None,
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> Any:
+    """Run the task body without occupying the event loop.
+
+    A synchronous body goes to a thread. Called inline it would stall every
+    other job in this child for its whole duration, which is the opposite of
+    what the concurrency setting promises.
+
+    A timeout cancels the await, and for a coroutine that cancels the work
+    too. The thread behind a synchronous body cannot be interrupted, so it
+    keeps running to completion in the background: the job is failed on time
+    and the slot comes back, but the side effects do not stop. Only a process
+    boundary could give that, and taking one would kill the jobs sharing it.
+    """
+    if task.is_async:
+        if context is not None:
+            return await task.fn(context, *args, **kwargs)
+        return await task.fn(*args, **kwargs)
+    return await asyncio.to_thread(task.fn, *args, **kwargs)
+
+
 async def _execute(
     app: Gylo,
     message: Dispatch,
@@ -77,12 +101,8 @@ async def _execute(
         return
 
     try:
-        if context is not None:
-            returned = task.fn(context, *args, **kwargs)
-        else:
-            returned = task.fn(*args, **kwargs)
-        if inspect.isawaitable(returned):
-            returned = await returned
+        async with asyncio.timeout(task.timeout):
+            returned = await _call(task, context, args, kwargs)
     except Exception as error:
         await _fail(writer, message.id, retry=task.should_retry(error))
         return
@@ -91,7 +111,7 @@ async def _execute(
     if task.store_result:
         try:
             stored = msgspec.msgpack.encode(returned)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             await _fail(writer, message.id, retry=False)
             return
 

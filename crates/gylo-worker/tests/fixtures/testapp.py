@@ -1,5 +1,7 @@
 import asyncio
 import os
+import threading
+import time
 from pathlib import Path
 
 import gylo
@@ -120,3 +122,25 @@ async def rendezvous(wanted: int) -> None:
             return
         await asyncio.sleep(0.05)
     raise RuntimeError(f"only {len(arrived)} of {wanted} children arrived")
+
+
+@app.task(name="hangs", timeout=0.2)
+async def hangs() -> None:
+    await asyncio.sleep(30)
+
+
+@app.task(name="sync_rendezvous")
+def sync_rendezvous(wanted: int) -> None:
+    """Completes only if synchronous bodies run off the event loop.
+
+    Run inline, the first of these occupies the loop for its whole duration and
+    the second is never dispatched, so neither ever sees the other.
+    """
+    with SIDE_EFFECTS.open("a") as log:
+        log.write(f"{threading.get_ident()}\n")
+
+    for _ in range(200):
+        if len(set(SIDE_EFFECTS.read_text().split())) >= wanted:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("synchronous bodies did not run concurrently")

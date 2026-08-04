@@ -64,7 +64,7 @@ def spawn(command: list[str]) -> subprocess.Popen[bytes]:
 def annihilate(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-    except ProcessLookupError, PermissionError:
+    except (ProcessLookupError, PermissionError):
         process.kill()
     process.wait(timeout=30)
 

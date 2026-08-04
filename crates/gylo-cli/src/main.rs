@@ -93,6 +93,57 @@ fn sibling_python() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// Stop signals, listened for from the moment this is built.
+///
+/// Container runtimes and init systems ask for shutdown with SIGTERM and only
+/// escalate to SIGKILL once a grace period runs out. A worker listening for
+/// interrupts alone never hears the request, so it is killed outright and its
+/// in-flight jobs sit unavailable until their leases expire.
+///
+/// Registration is separate from waiting, and happens before the worker
+/// connects to anything: a signal arriving in the second or so a pool takes to
+/// come up would otherwise find no handler installed and kill the process,
+/// which is exactly when a rollout is most likely to send one.
+#[cfg(unix)]
+struct StopSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    fn listen() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn received(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StopSignals;
+
+#[cfg(not(unix))]
+impl StopSignals {
+    fn listen() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn received(&mut self) -> &'static str {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
+    }
+}
+
 async fn connect(url: Option<String>, size: u32) -> Result<PgPool> {
     let url = url.context("set DATABASE_URL or pass --database-url")?;
     gylo_pg::connect(&url, size)
@@ -134,6 +185,7 @@ async fn main() -> Result<()> {
             python_path,
             pool_size,
         } => {
+            let mut signals = StopSignals::listen()?;
             let processes = processes.unwrap_or_else(|| Config::default().processes);
             // three at once per child — leasing, finalising, renewing — plus
             // the queue-wide listener and recovery
@@ -156,10 +208,12 @@ async fn main() -> Result<()> {
             let shutdown = CancellationToken::new();
             let signal = shutdown.clone();
             tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    tracing::info!("draining in-flight jobs, interrupt again to stop now");
-                    signal.cancel();
-                }
+                let received = signals.received().await;
+                tracing::info!(
+                    signal = received,
+                    "draining in-flight jobs, signal again to stop now"
+                );
+                signal.cancel();
             });
 
             tracing::info!(queue = %config.queue, "worker starting");
