@@ -47,7 +47,7 @@ struct Harness {
 impl Harness {
     async fn new(jobs: usize) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
+            .join("../..")
             .canonicalize()
             .unwrap();
         let ledger = std::env::temp_dir().join(format!("gylo-chaos-{}.ledger", std::process::id()));
@@ -95,7 +95,7 @@ impl Harness {
                 format!(
                     "{}:{}",
                     self.root.join("python").display(),
-                    self.root.join("chaos").display()
+                    self.root.join("crates/gylo-chaos").display()
                 ),
             )
             .env("GYLO_CHAOS_LEDGER", &self.ledger)
