@@ -88,7 +88,11 @@ Postgres.
 
 ## Requirements
 
-Python 3.11+ and PostgreSQL 14+.
+Python 3.11+ and PostgreSQL 14+, on Linux or macOS.
+
+Windows is not supported. The supervisor talks to its Python children over a
+Unix domain socket, and giving it a named-pipe transport is a piece of work
+rather than a build flag.
 
 ## Licence
 

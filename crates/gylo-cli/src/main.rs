@@ -137,11 +137,7 @@ struct WorkerArgs {
 /// first, so an activated environment or a system Python shadowing the venv
 /// silently runs task code somewhere the dependencies are not installed.
 fn sibling_python() -> PathBuf {
-    let name = if cfg!(windows) {
-        "python.exe"
-    } else {
-        "python3"
-    };
+    let name = "python3";
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|bin| bin.join(name)))
@@ -150,6 +146,10 @@ fn sibling_python() -> PathBuf {
 }
 
 /// Stop signals, listened for from the moment this is built.
+///
+/// Unix only, like the rest of the worker: the supervisor reaches its children
+/// over a Unix domain socket, so there is no build of this for a platform
+/// without one.
 ///
 /// Container runtimes and init systems ask for shutdown with SIGTERM and only
 /// escalate to SIGKILL once a grace period runs out. A worker listening for
@@ -160,13 +160,11 @@ fn sibling_python() -> PathBuf {
 /// connects to anything: a signal arriving in the second or so a pool takes to
 /// come up would otherwise find no handler installed and kill the process,
 /// which is exactly when a rollout is most likely to send one.
-#[cfg(unix)]
 struct StopSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(unix)]
 impl StopSignals {
     fn listen() -> Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
@@ -182,21 +180,6 @@ impl StopSignals {
             _ = self.interrupt.recv() => "SIGINT",
             _ = self.terminate.recv() => "SIGTERM",
         }
-    }
-}
-
-#[cfg(not(unix))]
-struct StopSignals;
-
-#[cfg(not(unix))]
-impl StopSignals {
-    fn listen() -> Result<Self> {
-        Ok(Self)
-    }
-
-    async fn received(&mut self) -> &'static str {
-        let _ = tokio::signal::ctrl_c().await;
-        "ctrl-c"
     }
 }
 

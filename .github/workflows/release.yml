@@ -18,14 +18,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # No Windows: the supervisor talks to its children over a Unix
+        # domain socket, which tokio does not offer there, so gylo does not
+        # compile for it at all. That needs a named-pipe transport, not a
+        # build flag. Both macOS targets build on the arm64 runner, since the
+        # x86_64 runners are being retired and queue indefinitely.
         platform:
           - { runner: ubuntu-22.04, target: x86_64, manylinux: auto }
           - { runner: ubuntu-22.04, target: aarch64, manylinux: auto }
           - { runner: ubuntu-22.04, target: x86_64, manylinux: musllinux_1_2 }
           - { runner: ubuntu-22.04, target: aarch64, manylinux: musllinux_1_2 }
           - { runner: macos-14, target: aarch64, manylinux: auto }
-          - { runner: macos-13, target: x86_64, manylinux: auto }
-          - { runner: windows-latest, target: x64, manylinux: auto }
+          - { runner: macos-14, target: x86_64, manylinux: auto }
 
     steps:
       - uses: actions/checkout@v4
