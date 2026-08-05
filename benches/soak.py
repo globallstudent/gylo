@@ -112,12 +112,8 @@ async def main() -> int:
             now = time.monotonic()
             if now >= next_wave:
                 next_wave = now + WAVE_EVERY
-                await soak_app.ok.enqueue_many(
-                    conn, [((note(1),), {}) for _ in range(20)]
-                )
-                await soak_app.slow.enqueue_many(
-                    conn, [((note(1),), {}) for _ in range(5)]
-                )
+                await soak_app.ok.enqueue_many(conn, [(note(1),) for _ in range(20)])
+                await soak_app.slow.enqueue_many(conn, [(note(1),) for _ in range(5)])
                 await soak_app.retry.options(max_attempts=2).enqueue(conn, note(2))
                 await soak_app.times_out.options(max_attempts=2).enqueue(conn, note(2))
                 await soak_app.steppy.enqueue(conn, note(1))

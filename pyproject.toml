@@ -55,6 +55,7 @@ include = [{ path = "migrations/**/*", format = "sdist" }]
 dev = [
   "asyncpg>=0.29",
   "greenlet>=3.0",
+  "mypy>=1.11",
   "psycopg[binary]>=3.1",
   "sqlalchemy>=2.0",
   "maturin>=1.9",

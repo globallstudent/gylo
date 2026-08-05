@@ -94,7 +94,7 @@ async def bench_gylo_transactional() -> None:
 
     await conn.execute("TRUNCATE gylo_job CASCADE")
     start = time.perf_counter()
-    await charge.enqueue_many(conn, [(ARGS, KWARGS)] * ROUNDS)
+    await charge.enqueue_many(conn, [gylo.call(*ARGS, **KWARGS)] * ROUNDS)
     report("gylo (pipelined)", "fire and forget", time.perf_counter() - start)
 
     await conn.execute("TRUNCATE gylo_job CASCADE")

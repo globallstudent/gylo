@@ -33,7 +33,7 @@ import hashlib
 import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, overload
+from typing import Any, Concatenate, Generic, Literal, ParamSpec, TypeVar, overload
 
 import msgspec
 
@@ -46,6 +46,7 @@ from ._workflow import Signature, Workflow, chain, chord, group
 __all__ = [
     "DEFAULT_TIMEOUT",
     "BoundTask",
+    "Call",
     "CronEntry",
     "Gylo",
     "JobContext",
@@ -60,6 +61,7 @@ __all__ = [
     "UnsupportedDriverError",
     "Workflow",
     "WrongConnectionError",
+    "call",
     "cancel",
     "cancel_sync",
     "chain",
@@ -98,6 +100,9 @@ DEFAULT_TIMEOUT = 300.0
 _INHERIT: Any = object()
 
 _encode = msgspec.msgpack.Encoder().encode
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def _async_adapter(conn: Any) -> tuple[Any, Any]:
@@ -144,7 +149,7 @@ class JobContext:
         return self.attempt >= self.max_attempts
 
 
-class Task:
+class Task(Generic[P, R]):
     """A registered task.
 
     Calling the instance runs the wrapped function directly, so a task stays
@@ -168,7 +173,7 @@ class Task:
         self,
         app: Gylo,
         name: str,
-        fn: Callable[..., Any],
+        fn: Callable[P, R],
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         no_retry_on: tuple[type[BaseException], ...] = (),
         store_result: bool = False,
@@ -199,7 +204,7 @@ class Task:
             return False
         return isinstance(error, self.retry_on)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         return self.fn(*args, **kwargs)
 
     def __repr__(self) -> str:
@@ -215,7 +220,7 @@ class Task:
         unique: bool | str | None = None,
         concurrency_key: str | None = None,
         max_concurrency: int | None = None,
-    ) -> BoundTask:
+    ) -> BoundTask[P]:
         """Bind enqueue options for the next call.
 
         Options live here rather than on `enqueue` so they cannot collide with
@@ -249,7 +254,7 @@ class Task:
             self, Options(**{k: v for k, v in given.items() if v is not None})
         )
 
-    async def enqueue(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
+    async def enqueue(self, conn: Any, /, *args: P.args, **kwargs: P.kwargs) -> int:
         """Insert the job on `conn`, returning its id.
 
         The connection is explicit so the insert lands in the caller's own
@@ -257,11 +262,11 @@ class Task:
         """
         return await self.options().enqueue(conn, *args, **kwargs)
 
-    def enqueue_sync(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
+    def enqueue_sync(self, conn: Any, /, *args: P.args, **kwargs: P.kwargs) -> int:
         """[`enqueue`] for synchronous code, on a synchronous connection."""
         return self.options().enqueue_sync(conn, *args, **kwargs)
 
-    async def submit(self, *args: Any, **kwargs: Any) -> int:
+    async def submit(self, *args: P.args, **kwargs: P.kwargs) -> int:
         """Enqueue on a connection borrowed from the app's pool.
 
         Convenient where no connection is at hand, and a weaker promise: the
@@ -274,7 +279,7 @@ class Task:
         self,
         conn: Any,
         /,
-        calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
+        calls: Sequence[tuple[Any, ...] | Call],
     ) -> None:
         return await self.options().enqueue_many(conn, calls)
 
@@ -282,11 +287,11 @@ class Task:
         self,
         conn: Any,
         /,
-        calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
+        calls: Sequence[tuple[Any, ...] | Call],
     ) -> None:
         return self.options().enqueue_many_sync(conn, calls)
 
-    def signature(self, *args: Any, **kwargs: Any) -> Signature:
+    def signature(self, *args: P.args, **kwargs: P.kwargs) -> Signature:
         """The task and these arguments, for placing in a workflow."""
         return self.options().signature(*args, **kwargs)
 
@@ -344,12 +349,25 @@ def _unique_key(
     ).digest()
 
 
-class BoundTask:
+@dataclass(frozen=True, slots=True)
+class Call:
+    """Arguments held for a batched enqueue, when keywords are needed."""
+
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
+
+
+def call(*args: Any, **kwargs: Any) -> Call:
+    """Package arguments for [`enqueue_many`], keywords included."""
+    return Call(args, kwargs)
+
+
+class BoundTask(Generic[P]):
     """A task with the options its next enqueue will use."""
 
     __slots__ = ("options", "task")
 
-    def __init__(self, task: Task, options: Options) -> None:
+    def __init__(self, task: Task[P, Any], options: Options) -> None:
         self.task = task
         self.options = options
 
@@ -376,7 +394,7 @@ class BoundTask:
             return row
         return (*row, _unique_key(self.task.name, self.options, args, kwargs))
 
-    def signature(self, *args: Any, **kwargs: Any) -> Signature:
+    def signature(self, *args: P.args, **kwargs: P.kwargs) -> Signature:
         """The task and these arguments, for placing in a workflow."""
         return Signature(
             task=self.task.name,
@@ -386,12 +404,12 @@ class BoundTask:
             durable=self.task.durable,
         )
 
-    async def submit(self, *args: Any, **kwargs: Any) -> int:
+    async def submit(self, *args: P.args, **kwargs: P.kwargs) -> int:
         """Enqueue on a connection borrowed from the app's pool."""
         async with self.task._app.borrow() as conn:
             return await self.enqueue(conn, *args, **kwargs)
 
-    async def enqueue(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
+    async def enqueue(self, conn: Any, /, *args: P.args, **kwargs: P.kwargs) -> int:
         """Insert the job, returning its id.
 
         With `unique` set, the id may belong to a job that was already queued.
@@ -402,7 +420,7 @@ class BoundTask:
             return await adapter.insert(conn, row)
         return await adapter.insert_unique(conn, row)
 
-    def enqueue_sync(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
+    def enqueue_sync(self, conn: Any, /, *args: P.args, **kwargs: P.kwargs) -> int:
         """[`enqueue`] for synchronous code — a Django view, a Flask handler.
 
         Takes a synchronous driver connection, or anything wrapping one, and
@@ -414,34 +432,52 @@ class BoundTask:
             return adapter.insert(conn, row)
         return adapter.insert_unique(conn, row)
 
+    def _rows(self, calls: Sequence[tuple[Any, ...] | Call]) -> list[tuple[Any, ...]]:
+        rows = []
+        for item in calls:
+            if isinstance(item, Call):
+                rows.append(self._row(item.args, item.kwargs))
+            elif isinstance(item, tuple):
+                rows.append(self._row(item, {}))
+            else:
+                raise TypeError(
+                    f"each element must be a tuple of positional arguments or "
+                    f"gylo.call(...), got {type(item).__name__}"
+                )
+        return rows
+
     async def enqueue_many(
         self,
         conn: Any,
         /,
-        calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
+        calls: Sequence[tuple[Any, ...] | Call],
     ) -> None:
         """Insert many jobs in one round trip.
 
-        Ids are not returned, because reporting them per row would cost the
-        pipelining that makes this worth using over a loop of `enqueue`.
+        Each element is a tuple of positional arguments — `[(1,), (2,)]` — or
+        [`call`] when keywords are needed. Ids are not returned, because
+        reporting them per row would cost the pipelining that makes this worth
+        using over a loop of `enqueue`.
         """
         if not calls:
             return
-        rows = [self._row(call_args, call_kwargs) for call_args, call_kwargs in calls]
         adapter, conn = _async_adapter(conn)
-        await adapter.insert_many(conn, rows, unique=self.options.unique is not False)
+        await adapter.insert_many(
+            conn, self._rows(calls), unique=self.options.unique is not False
+        )
 
     def enqueue_many_sync(
         self,
         conn: Any,
         /,
-        calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
+        calls: Sequence[tuple[Any, ...] | Call],
     ) -> None:
         if not calls:
             return
-        rows = [self._row(call_args, call_kwargs) for call_args, call_kwargs in calls]
         adapter, conn = _sync_adapter(conn)
-        adapter.insert_many(conn, rows, unique=self.options.unique is not False)
+        adapter.insert_many(
+            conn, self._rows(calls), unique=self.options.unique is not False
+        )
 
 
 class Gylo:
@@ -450,7 +486,7 @@ class Gylo:
     __slots__ = ("_crons", "_pool", "_tasks", "default_timeout")
 
     def __init__(self, *, default_timeout: float | None = DEFAULT_TIMEOUT) -> None:
-        self._tasks: dict[str, Task] = {}
+        self._tasks: dict[str, Task[Any, Any]] = {}
         self._crons: dict[str, CronEntry] = {}
         self._pool: Any = None
         self.default_timeout = default_timeout
@@ -472,7 +508,31 @@ class Gylo:
         return self._pool.acquire()
 
     @overload
-    def task(self, fn: Callable[..., Any]) -> Task: ...
+    def task(self, fn: Callable[P, R]) -> Task[P, R]: ...
+
+    @overload
+    def task(
+        self,
+        *,
+        durable: Literal[True],
+        name: str | None = ...,
+        retry_on: tuple[type[BaseException], ...] = ...,
+        no_retry_on: tuple[type[BaseException], ...] = ...,
+        store_result: bool = ...,
+        timeout: float | None = ...,
+    ) -> Callable[[Callable[Concatenate[StepContext, P], R]], Task[P, R]]: ...
+
+    @overload
+    def task(
+        self,
+        *,
+        context: Literal[True],
+        name: str | None = ...,
+        retry_on: tuple[type[BaseException], ...] = ...,
+        no_retry_on: tuple[type[BaseException], ...] = ...,
+        store_result: bool = ...,
+        timeout: float | None = ...,
+    ) -> Callable[[Callable[Concatenate[JobContext, P], R]], Task[P, R]]: ...
 
     @overload
     def task(
@@ -482,10 +542,8 @@ class Gylo:
         retry_on: tuple[type[BaseException], ...] = ...,
         no_retry_on: tuple[type[BaseException], ...] = ...,
         store_result: bool = ...,
-        durable: bool = ...,
-        context: bool = ...,
         timeout: float | None = ...,
-    ) -> Callable[[Callable[..., Any]], Task]: ...
+    ) -> Callable[[Callable[P, R]], Task[P, R]]: ...
 
     def task(
         self,
@@ -498,7 +556,7 @@ class Gylo:
         durable: bool = False,
         context: bool = False,
         timeout: float | None = _INHERIT,
-    ) -> Task | Callable[[Callable[..., Any]], Task]:
+    ) -> Any:
         """Register a function as a task, bare or called with arguments.
 
         `durable` gives the task a step context as its first argument. Steps it
@@ -519,7 +577,7 @@ class Gylo:
         for never wedging.
         """
 
-        def register(func: Callable[..., Any]) -> Task:
+        def register(func: Callable[..., Any]) -> Task[Any, Any]:
             task_name = name or f"{func.__module__}.{func.__qualname__}"
             if task_name in self._tasks:
                 raise ValueError(f"task {task_name!r} is already registered")
@@ -558,7 +616,7 @@ class Gylo:
         queue: str = DEFAULT_QUEUE,
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> Callable[[Callable[..., Any]], Task]:
+    ) -> Callable[[Callable[P, R]], Task[P, R]]:
         """Register a task that also runs on a schedule.
 
         The schedule travels to the supervisor when a worker starts, so the
@@ -567,7 +625,7 @@ class Gylo:
         advances to its next occurrence.
         """
 
-        def register(func: Callable[..., Any]) -> Task:
+        def register(func: Callable[..., Any]) -> Task[Any, Any]:
             task = self.task(func, name=name)
             schedule_name = name or task.name
             if schedule_name in self._crons:
@@ -589,13 +647,13 @@ class Gylo:
         """Every schedule registered, in declaration order."""
         return tuple(self._crons.values())
 
-    def get(self, name: str) -> Task:
+    def get(self, name: str) -> Task[Any, Any]:
         try:
             return self._tasks[name]
         except KeyError:
             raise UnknownTaskError(name) from None
 
-    def find(self, name: str) -> Task | None:
+    def find(self, name: str) -> Task[Any, Any] | None:
         return self._tasks.get(name)
 
     @property

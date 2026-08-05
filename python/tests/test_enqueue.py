@@ -86,7 +86,7 @@ async def test_delay_pushes_the_schedule_out(conn):
 async def test_enqueue_many_inserts_every_call(conn):
     await send_receipt.options(queue="bulk").enqueue_many(
         conn,
-        [((i,), {"email": f"user{i}@example.com"}) for i in range(25)],
+        [gylo.call(i, email=f"user{i}@example.com") for i in range(25)],
     )
 
     assert await count(conn) == 25
@@ -208,7 +208,7 @@ async def test_a_non_unique_job_is_never_deduplicated(conn):
 
 async def test_enqueue_many_deduplicates_within_the_batch(conn):
     await rebuild_index.options(unique=True).enqueue_many(
-        conn, [(("acme",), {}), (("acme",), {}), (("other",), {})]
+        conn, [("acme",), ("acme",), ("other",)]
     )
 
     assert await count(conn) == 2

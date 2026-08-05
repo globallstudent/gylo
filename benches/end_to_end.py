@@ -83,7 +83,7 @@ def seed_gylo() -> None:
         conn = await asyncpg.connect(DSN)
         await conn.execute("TRUNCATE gylo_job CASCADE")
         await gylo_app.work.options(queue="bench").enqueue_many(
-            conn, [((n,), {}) for n in range(JOBS)]
+            conn, [(n,) for n in range(JOBS)]
         )
         await conn.close()
 

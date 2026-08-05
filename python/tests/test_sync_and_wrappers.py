@@ -64,7 +64,7 @@ def test_sync_enqueue_joins_the_callers_transaction(sync_conn):
 
 
 def test_sync_enqueue_many_and_outcome(sync_conn):
-    work.enqueue_many_sync(sync_conn, [((n,), {}) for n in range(5)])
+    work.enqueue_many_sync(sync_conn, [(n,) for n in range(5)])
 
     with sync_conn.cursor() as cursor:
         cursor.execute("SELECT count(*), min(id) FROM gylo_job")
