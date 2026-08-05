@@ -1073,3 +1073,84 @@ pub async fn queues<'e, E: PgExecutor<'e>>(executor: E) -> Result<Vec<String>, E
     let rows = sqlx::query(QUEUE_NAMES).fetch_all(executor).await?;
     Ok(rows.into_iter().map(|row| row.get("queue")).collect())
 }
+
+/// Deletes finished jobs older than the window, oldest first.
+///
+/// `states` distinguishes jobs that ended well from dead letters because they
+/// deserve different windows: a completed row is only history, while a
+/// discarded one is evidence an operator may not have looked at yet.
+///
+/// A job in a workflow is kept while any member of that workflow is still
+/// waiting or running, however old it is. Cascade-cancel and fan-in are settled
+/// by then, but a graph being inspected mid-flight should read whole.
+const PRUNE: &str = "
+    WITH victims AS (
+        SELECT j.id FROM gylo_job j
+        WHERE j.state = ANY($1::gylo_job_state[])
+          AND j.finalized_at < now() - make_interval(secs => $2)
+          AND ($3::text IS NULL OR j.queue = $3)
+          AND (j.workflow_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM gylo_job u
+                WHERE u.workflow_id = j.workflow_id
+                  AND u.state IN ('available', 'running')))
+        ORDER BY j.finalized_at
+        LIMIT $4
+        FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM gylo_job d USING victims v WHERE d.id = v.id
+";
+
+async fn prune_states<'e, E: PgExecutor<'e>>(
+    executor: E,
+    states: &[&str],
+    older_than: Duration,
+    queue: Option<&str>,
+    limit: i64,
+) -> Result<u64, Error> {
+    Ok(sqlx::query(PRUNE)
+        .bind(states)
+        .bind(older_than.as_secs_f64())
+        .bind(queue)
+        .bind(limit)
+        .execute(executor)
+        .await?
+        .rows_affected())
+}
+
+pub async fn prune_completed<'e, E: PgExecutor<'e>>(
+    executor: E,
+    older_than: Duration,
+    queue: Option<&str>,
+    limit: i64,
+) -> Result<u64, Error> {
+    prune_states(
+        executor,
+        &["completed", "cancelled"],
+        older_than,
+        queue,
+        limit,
+    )
+    .await
+}
+
+pub async fn prune_discarded<'e, E: PgExecutor<'e>>(
+    executor: E,
+    older_than: Duration,
+    queue: Option<&str>,
+    limit: i64,
+) -> Result<u64, Error> {
+    prune_states(executor, &["discarded"], older_than, queue, limit).await
+}
+
+/// Removes workflow rows whose every job has been pruned. Only committed rows
+/// are visible here, and a committed workflow always had jobs, so an empty one
+/// is finished history rather than one mid-construction.
+pub async fn prune_workflows<'e, E: PgExecutor<'e>>(executor: E) -> Result<u64, Error> {
+    Ok(sqlx::query(
+        "DELETE FROM gylo_workflow w
+         WHERE NOT EXISTS (SELECT 1 FROM gylo_job j WHERE j.workflow_id = w.id)",
+    )
+    .execute(executor)
+    .await?
+    .rows_affected())
+}

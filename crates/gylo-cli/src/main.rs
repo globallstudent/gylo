@@ -59,6 +59,20 @@ enum JobsCommand {
         #[arg(long)]
         queue: Option<String>,
     },
+    /// Delete finished jobs older than a window, as retention would.
+    Prune {
+        /// Age below which nothing is touched, e.g. `7d` or `24h`.
+        #[arg(long)]
+        older_than: humantime::Duration,
+
+        #[arg(long)]
+        queue: Option<String>,
+
+        /// Also prune dead-lettered jobs, which the automatic retention keeps
+        /// on a longer window because they are evidence, not history.
+        #[arg(long)]
+        discarded: bool,
+    },
     /// Delete dead-lettered jobs for good.
     Purge {
         #[arg(long)]
@@ -110,6 +124,15 @@ struct WorkerArgs {
     /// stay well below the lease.
     #[arg(long, default_value = "10s")]
     maintenance_interval: humantime::Duration,
+
+    /// How long finished jobs and their results are kept before maintenance
+    /// deletes them.
+    #[arg(long, default_value = "24h")]
+    retain_completed: humantime::Duration,
+
+    /// How long dead-lettered jobs are kept for inspection and retry.
+    #[arg(long, default_value = "7d")]
+    retain_discarded: humantime::Duration,
 
     /// Interpreter to run task code with. Defaults to the one beside this
     /// executable, falling back to `python3` on PATH.
@@ -277,6 +300,40 @@ async fn retry_failed(pool: &PgPool, ids: Vec<i64>, queue: Option<String>) -> Re
     Ok(())
 }
 
+async fn prune_finished(
+    pool: &PgPool,
+    older_than: std::time::Duration,
+    queue: Option<String>,
+    discarded: bool,
+) -> Result<()> {
+    let mut removed = 0u64;
+    loop {
+        let batch = gylo_pg::prune_completed(pool, older_than, queue.as_deref(), 5000)
+            .await
+            .context("pruning finished jobs")?;
+        removed += batch;
+        if batch < 5000 {
+            break;
+        }
+    }
+    if discarded {
+        loop {
+            let batch = gylo_pg::prune_discarded(pool, older_than, queue.as_deref(), 5000)
+                .await
+                .context("pruning dead-lettered jobs")?;
+            removed += batch;
+            if batch < 5000 {
+                break;
+            }
+        }
+    }
+    gylo_pg::prune_workflows(pool)
+        .await
+        .context("pruning finished workflows")?;
+    println!("{removed} job(s) pruned");
+    Ok(())
+}
+
 async fn purge_failed(pool: &PgPool, queue: Option<String>, confirmed: bool) -> Result<()> {
     if !confirmed {
         anyhow::bail!("pass --yes to delete dead-lettered jobs; this cannot be undone");
@@ -325,6 +382,11 @@ async fn main() -> Result<()> {
             match command {
                 JobsCommand::Failed { queue, limit } => show_failed(&pool, queue, limit).await,
                 JobsCommand::Retry { ids, queue } => retry_failed(&pool, ids, queue).await,
+                JobsCommand::Prune {
+                    older_than,
+                    queue,
+                    discarded,
+                } => prune_finished(&pool, older_than.into(), queue, discarded).await,
                 JobsCommand::Purge { queue, yes } => purge_failed(&pool, queue, yes).await,
             }
         }
@@ -338,6 +400,8 @@ async fn main() -> Result<()> {
                 lease,
                 poll_interval,
                 maintenance_interval,
+                retain_completed,
+                retain_discarded,
                 python,
                 python_path,
                 pool_size,
@@ -366,6 +430,8 @@ async fn main() -> Result<()> {
                 lease: lease.into(),
                 poll_interval: poll_interval.into(),
                 maintenance_interval: maintenance_interval.into(),
+                retain_completed: retain_completed.into(),
+                retain_discarded: retain_discarded.into(),
                 python: python.unwrap_or_else(sibling_python),
                 app,
                 python_path,

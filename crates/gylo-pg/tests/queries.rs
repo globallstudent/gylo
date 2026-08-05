@@ -1005,3 +1005,97 @@ async fn a_full_unkeyed_batch_does_not_starve_keyed_work(pool: PgPool) {
          without a floor the keyed pass never runs at all"
     );
 }
+
+async fn finished(pool: &PgPool, task: &str, state: &str, days_ago: i32) -> i64 {
+    let id = enqueue(pool, &NewJob::new(task, Vec::new())).await.unwrap();
+    sqlx::query(
+        "UPDATE gylo_job
+         SET state = $2::gylo_job_state,
+             finalized_at = now() - make_interval(days => $3)
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(state)
+    .bind(days_ago)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_removes_old_history_and_nothing_else(pool: PgPool) {
+    let old = finished(&pool, "t", "completed", 2).await;
+    let cancelled = finished(&pool, "t", "cancelled", 2).await;
+    let young = finished(&pool, "t", "completed", 0).await;
+    let dead = finished(&pool, "t", "discarded", 30).await;
+    let waiting = enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+
+    let removed = gylo_pg::prune_completed(&pool, Duration::from_secs(24 * 3600), None, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 2);
+    for (id, why) in [
+        (young, "inside the window"),
+        (dead, "dead letters have their own window"),
+        (waiting, "unfinished jobs are never history"),
+    ] {
+        let exists: bool = sqlx::query("SELECT EXISTS (SELECT 1 FROM gylo_job WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert!(exists, "{id} should have been kept: {why}");
+    }
+    let gone: i64 = sqlx::query("SELECT count(*) FROM gylo_job WHERE id = ANY($1)")
+        .bind(vec![old, cancelled])
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(gone, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_never_breaks_up_a_live_workflow(pool: PgPool) {
+    let members = workflow_of(&pool, &["done", "waiting"]).await;
+    sqlx::query(
+        "UPDATE gylo_job
+         SET state = 'completed', finalized_at = now() - interval '30 days'
+         WHERE id = $1",
+    )
+    .bind(members[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let removed = gylo_pg::prune_completed(&pool, Duration::from_secs(3600), None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        removed, 0,
+        "a graph being inspected mid-flight must read whole, however old its \
+         finished members are"
+    );
+
+    sqlx::query(
+        "UPDATE gylo_job
+         SET state = 'completed', finalized_at = now() - interval '30 days',
+             scheduled_at = now()
+         WHERE id = $1",
+    )
+    .bind(members[1])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let removed = gylo_pg::prune_completed(&pool, Duration::from_secs(3600), None, 100)
+        .await
+        .unwrap();
+    let orphans = gylo_pg::prune_workflows(&pool).await.unwrap();
+
+    assert_eq!(removed, 2, "a finished workflow is history like any other");
+    assert_eq!(orphans, 1, "and its workflow row goes with it");
+}

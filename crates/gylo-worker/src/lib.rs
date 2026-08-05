@@ -78,6 +78,15 @@ pub struct Config {
     /// stay comfortably below `lease` or live jobs will be reclaimed.
     pub maintenance_interval: Duration,
     pub reclaim_limit: i64,
+    /// How long finished jobs are kept before maintenance deletes them.
+    /// Results live on the row, so this is also how long a result is
+    /// retrievable. Dead letters get their own window in `retain_discarded`,
+    /// since a discarded row is evidence rather than history.
+    pub retain_completed: Duration,
+    pub retain_discarded: Duration,
+    /// Rows deleted per statement while pruning. Batched so retention never
+    /// holds a long transaction against the table the workers are using.
+    pub prune_batch: i64,
     /// First retry lands after roughly this long, doubling per attempt.
     pub retry_base: Duration,
     /// Ceiling on the doubling, before jitter.
@@ -112,6 +121,9 @@ impl Default for Config {
             completion_linger: Duration::from_millis(5),
             maintenance_interval: Duration::from_secs(10),
             reclaim_limit: 1000,
+            retain_completed: Duration::from_secs(24 * 3600),
+            retain_discarded: Duration::from_secs(7 * 24 * 3600),
+            prune_batch: 5000,
             retry_base: Duration::from_secs(1),
             retry_cap: Duration::from_secs(3600),
             max_restarts: 8,
@@ -260,6 +272,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
         internal.clone(),
     ));
     let recovering = tokio::spawn(recover(pool.clone(), config.clone(), internal.clone()));
+    let retaining = tokio::spawn(retain(pool.clone(), config.clone(), internal.clone()));
 
     observe::children(config.processes);
     let mut children = tokio::task::JoinSet::new();
@@ -286,6 +299,7 @@ pub async fn run(pool: PgPool, config: Config, shutdown: CancellationToken) -> R
 
     listening.abort();
     recovering.abort();
+    retaining.abort();
     outcome
 }
 
@@ -518,7 +532,63 @@ async fn renew(
     }
 }
 
-/// Fires due schedules and recovers leases whose worker died.
+/// Enforces retention on its own cadence, apart from lease recovery.
+///
+/// Deleting expired history is the one maintenance duty that can take seconds
+/// when a backlog has built up, and reclaim must never wait behind it: reclaim
+/// latency is crash-recovery latency. Batches are bounded and the tick is
+/// time-boxed, so a large backlog is worked off across ticks while everything
+/// else stays current.
+async fn retain(pool: PgPool, config: Config, shutdown: CancellationToken) {
+    const TICK_BUDGET: Duration = Duration::from_secs(5);
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(config.maintenance_interval) => {}
+        }
+
+        let started = tokio::time::Instant::now();
+        let mut removed = 0u64;
+        loop {
+            let batch = match gylo_pg::prune_completed(
+                &pool,
+                config.retain_completed,
+                None,
+                config.prune_batch,
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::error!(%error, "pruning completed jobs failed");
+                    break;
+                }
+            };
+            removed += batch;
+            if batch < config.prune_batch as u64 || started.elapsed() > TICK_BUDGET {
+                break;
+            }
+        }
+        if started.elapsed() <= TICK_BUDGET {
+            match gylo_pg::prune_discarded(&pool, config.retain_discarded, None, config.prune_batch)
+                .await
+            {
+                Ok(count) => removed += count,
+                Err(error) => tracing::error!(%error, "pruning dead letters failed"),
+            }
+        }
+        if removed > 0 {
+            if let Err(error) = gylo_pg::prune_workflows(&pool).await {
+                tracing::error!(%error, "pruning finished workflows failed");
+            }
+            observe::pruned(removed);
+            tracing::info!(removed, "enforced retention");
+        }
+    }
+}
+
+/// Fires due schedules and recovers leases whose worker died./// Fires due schedules and recovers leases whose worker died.
 ///
 /// Once per worker process rather than once per child: both are queue-wide, so
 /// running them per child would multiply the work without finding anything a

@@ -1007,3 +1007,45 @@ async fn a_key_limits_concurrency_within_one_worker(pool: PgPool) {
     }
     assert_eq!(peak, 1, "one worker, four children");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retention_is_enforced_while_the_worker_runs(pool: PgPool) {
+    for _ in 0..5 {
+        enqueue(&pool, &NewJob::new("ok", Vec::new()))
+            .await
+            .unwrap();
+    }
+
+    let shutdown = CancellationToken::new();
+    let worker = tokio::spawn(run(
+        pool.clone(),
+        Config {
+            retain_completed: Duration::ZERO,
+            maintenance_interval: Duration::from_millis(200),
+            lease: Duration::from_secs(5),
+            ..config()
+        },
+        shutdown.clone(),
+    ));
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let left: i64 = sqlx::query("SELECT count(*) FROM gylo_job")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
+        if left == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{left} finished jobs were never pruned; retention is configured \
+             but maintenance is not enforcing it"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown.cancel();
+    worker.await.unwrap().expect("worker failed");
+}

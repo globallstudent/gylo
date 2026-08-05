@@ -23,6 +23,7 @@ pub const SCHEDULED: &str = "gylo_queue_scheduled";
 pub const BLOCKED: &str = "gylo_queue_blocked";
 pub const RUNNING: &str = "gylo_queue_running";
 pub const FLUSH_SECONDS: &str = "gylo_completion_flush_seconds";
+pub const PRUNED: &str = "gylo_jobs_pruned_total";
 
 pub fn leased(count: usize) {
     counter!(LEASED).increment(count as u64);
@@ -57,4 +58,8 @@ pub fn depth(queue: &str, depth: gylo_pg::Depth) {
     gauge!(SCHEDULED, "queue" => owned.clone()).set(depth.scheduled as f64);
     gauge!(BLOCKED, "queue" => owned.clone()).set(depth.blocked as f64);
     gauge!(RUNNING, "queue" => owned).set(depth.running as f64);
+}
+
+pub fn pruned(count: u64) {
+    counter!(PRUNED).increment(count);
 }
