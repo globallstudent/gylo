@@ -1028,7 +1028,10 @@ async fn retention_is_enforced_while_the_worker_runs(pool: PgPool) {
         shutdown.clone(),
     ));
 
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    // twice the usual settle window: this waits on the maintenance cadence,
+    // not just job completion, and a loaded two-core CI runner has every other
+    // test's Python children competing for the same clock
+    let deadline = tokio::time::Instant::now() + TIMEOUT * 2;
     loop {
         let left: i64 = sqlx::query("SELECT count(*) FROM gylo_job")
             .fetch_one(&pool)
