@@ -59,3 +59,6 @@ children over a Unix domain socket.
 - [Getting started](quickstart.md) — running in five minutes
 - [Tasks and options](tasks.md) — the API you will actually use
 - [Deployment](deployment.md) — processes, leases, shutdown, what to alert on
+- Migrating from [Celery](migrate-celery.md), [Dramatiq](migrate-dramatiq.md),
+  [arq](migrate-arq.md) or [TaskIQ](migrate-taskiq.md) — concept by concept,
+  sharp edges included

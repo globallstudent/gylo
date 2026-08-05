@@ -48,3 +48,8 @@ nav:
   - Running it:
       - Deployment: deployment.md
       - Operations: operations.md
+  - Migrating:
+      - From Celery: migrate-celery.md
+      - From Dramatiq: migrate-dramatiq.md
+      - From arq: migrate-arq.md
+      - From TaskIQ: migrate-taskiq.md
