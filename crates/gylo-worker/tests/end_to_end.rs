@@ -1028,12 +1028,12 @@ async fn retention_is_enforced_while_the_worker_runs(pool: PgPool) {
         shutdown.clone(),
     ));
 
-    // twice the usual settle window: this waits on the maintenance cadence,
-    // not just job completion, and a loaded two-core CI runner has every other
-    // test's Python children competing for the same clock
-    let deadline = tokio::time::Instant::now() + TIMEOUT * 2;
+    // scoped to the queue under test: the fixture's every-second cron drops
+    // jobs onto `beat` that nothing consumes, so they are never finalised and
+    // never prunable — counting them makes zero unreachable on any deadline
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        let left: i64 = sqlx::query("SELECT count(*) FROM gylo_job")
+        let left: i64 = sqlx::query("SELECT count(*) FROM gylo_job WHERE queue = 'default'")
             .fetch_one(&pool)
             .await
             .unwrap()
