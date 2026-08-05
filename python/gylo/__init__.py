@@ -1,4 +1,31 @@
-"""gylo — a distributed task queue for Python with a Rust core."""
+"""gylo — a distributed task queue for Python with a Rust core.
+
+Define tasks on an app, enqueue them on your own database connection, and run
+a worker::
+
+    import gylo
+
+    app = gylo.Gylo()
+
+    @app.task
+    async def send_receipt(order_id: int) -> None: ...
+
+    # inside your own transaction — the job commits with your data or not at all
+    await send_receipt.enqueue(conn, order_id=42)
+
+    # synchronous code (Django, Flask) uses the _sync counterparts
+    send_receipt.enqueue_sync(conn, order_id=42)
+
+Then::
+
+    gylo migrate
+    gylo worker --app myapp:app
+
+Options ride on the task, not the call site: `send_receipt.options(queue="mail",
+delay=30).enqueue(conn, ...)`. Workflows compose with `chain`, `group` and
+`chord`; `durable=True` gives a task replayable steps; `context=True` lets it
+see its own attempt number.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +33,12 @@ import hashlib
 import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, overload
 
 import msgspec
 
-from ._adapters import UnsupportedDriverError, WrongFlavourError, resolve
+from ._adapters import UnsupportedDriverError, WrongConnectionError
+from ._adapters import resolve as _resolve
 from ._protocol import payload_limit
 from ._steps import StepContext
 from ._workflow import Signature, Workflow, chain, chord, group
@@ -31,7 +59,7 @@ __all__ = [
     "UnknownTaskError",
     "UnsupportedDriverError",
     "Workflow",
-    "WrongFlavourError",
+    "WrongConnectionError",
     "cancel",
     "cancel_sync",
     "chain",
@@ -39,7 +67,21 @@ __all__ = [
     "group",
     "outcome",
     "outcome_sync",
+    "payload_limit",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "__version__":
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("gylo")
+        except PackageNotFoundError:
+            # a source tree rather than an installed distribution
+            return "0.0.0.dev0"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 DEFAULT_QUEUE = "default"
 DEFAULT_MAX_ATTEMPTS = 20
@@ -59,18 +101,18 @@ _encode = msgspec.msgpack.Encoder().encode
 
 
 def _async_adapter(conn: Any) -> tuple[Any, Any]:
-    adapter, conn = resolve(conn)
+    adapter, conn = _resolve(conn)
     if not adapter.IS_ASYNC:
-        raise WrongFlavourError(
+        raise WrongConnectionError(
             "this connection is synchronous; use the _sync variant of the call"
         )
     return adapter, conn
 
 
 def _sync_adapter(conn: Any) -> tuple[Any, Any]:
-    adapter, conn = resolve(conn)
+    adapter, conn = _resolve(conn)
     if adapter.IS_ASYNC:
-        raise WrongFlavourError(
+        raise WrongConnectionError(
             "this connection is asynchronous; await the plain variant instead"
         )
     return adapter, conn
@@ -429,6 +471,22 @@ class Gylo:
             )
         return self._pool.acquire()
 
+    @overload
+    def task(self, fn: Callable[..., Any]) -> Task: ...
+
+    @overload
+    def task(
+        self,
+        *,
+        name: str | None = ...,
+        retry_on: tuple[type[BaseException], ...] = ...,
+        no_retry_on: tuple[type[BaseException], ...] = ...,
+        store_result: bool = ...,
+        durable: bool = ...,
+        context: bool = ...,
+        timeout: float | None = ...,
+    ) -> Callable[[Callable[..., Any]], Task]: ...
+
     def task(
         self,
         fn: Callable[..., Any] | None = None,
@@ -440,7 +498,7 @@ class Gylo:
         durable: bool = False,
         context: bool = False,
         timeout: float | None = _INHERIT,
-    ) -> Any:
+    ) -> Task | Callable[[Callable[..., Any]], Task]:
         """Register a function as a task, bare or called with arguments.
 
         `durable` gives the task a step context as its first argument. Steps it
@@ -500,7 +558,7 @@ class Gylo:
         queue: str = DEFAULT_QUEUE,
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> Any:
+    ) -> Callable[[Callable[..., Any]], Task]:
         """Register a task that also runs on a schedule.
 
         The schedule travels to the supervisor when a worker starts, so the

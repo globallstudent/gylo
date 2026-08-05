@@ -23,7 +23,7 @@ from typing import Any, Protocol
 
 import msgspec
 
-__all__ = ["UnsupportedDriverError", "WrongFlavourError", "resolve"]
+__all__ = ["UnsupportedDriverError", "WrongConnectionError", "resolve"]
 
 _COLUMNS = (
     "queue",
@@ -45,7 +45,7 @@ class UnsupportedDriverError(TypeError):
     """No adapter recognises the given connection object."""
 
 
-class WrongFlavourError(TypeError):
+class WrongConnectionError(TypeError):
     """A sync connection reached the async API, or the other way around."""
 
 

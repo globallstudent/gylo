@@ -75,14 +75,14 @@ def test_sync_enqueue_many_and_outcome(sync_conn):
 
 
 def test_a_sync_connection_is_refused_by_the_async_api(sync_conn):
-    with pytest.raises(gylo.WrongFlavourError, match="_sync variant"):
+    with pytest.raises(gylo.WrongConnectionError, match="_sync variant"):
         work.enqueue(sync_conn, 1).send(None)
 
 
 @pytest.mark.asyncio
 async def test_an_async_connection_is_refused_by_the_sync_api(pool):
     async with pool.acquire() as conn:
-        with pytest.raises(gylo.WrongFlavourError, match="await the plain"):
+        with pytest.raises(gylo.WrongConnectionError, match="await the plain"):
             work.enqueue_sync(conn, 1)
 
 
