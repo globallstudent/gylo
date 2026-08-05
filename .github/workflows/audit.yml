@@ -1,0 +1,40 @@
+name: Audit
+
+on:
+  push:
+    branches: [main]
+    paths: ["Cargo.lock", "Cargo.toml", "crates/**/Cargo.toml", "pyproject.toml"]
+  # a vulnerability is usually published long after the last push that could
+  # have caught it, so the tree is re-checked on a clock as well
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@cargo-audit
+
+      - run: cargo audit
+
+      - uses: astral-sh/setup-uv@v5
+
+      - run: uv venv --python 3.11
+
+      - run: uv pip install pip-audit
+
+      # only what the wheel makes users install, read from the real source of
+      # truth — auditing a whole venv would flag pip-audit's own tree instead
+      - run: |
+          python3 -c "
+          import tomllib
+          deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']
+          print('\n'.join(deps))
+          " > runtime-deps.txt
+          .venv/bin/pip-audit -r runtime-deps.txt
