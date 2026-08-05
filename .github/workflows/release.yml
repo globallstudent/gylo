@@ -64,8 +64,37 @@ jobs:
           name: sdist
           path: dist
 
+  # Runs the built wheel on the hardware it claims, because a wheel that only
+  # ever cross-compiled has proven nothing about executing. The arm runner is
+  # real aarch64, which the Linux arm wheel had never touched before this job.
+  smoke:
+    needs: [wheels]
+    strategy:
+      fail-fast: false
+      matrix:
+        probe:
+          - { runner: ubuntu-24.04, artifact: wheels-ubuntu-22.04-x86_64-auto }
+          - { runner: ubuntu-24.04-arm, artifact: wheels-ubuntu-22.04-aarch64-2_28 }
+          - { runner: macos-14, artifact: wheels-macos-14-aarch64-auto }
+    runs-on: ${{ matrix.probe.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.probe.artifact }}
+          path: dist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m venv smoke && smoke/bin/pip install --quiet dist/*.whl
+
+      - run: smoke/bin/gylo --version
+
+      - run: smoke/bin/python -c "import gylo; print('import ok,', gylo.__version__)"
+
   publish:
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, smoke]
     runs-on: ubuntu-latest
     # only a tag publishes, so a manual run is a safe way to prove the wheels
     # build without spending a version number that can never be reused

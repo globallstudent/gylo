@@ -47,6 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - run: python3 .github/check-versions.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -59,7 +61,9 @@ jobs:
       # than only the syntax check inside it
       - run: uv venv --python 3.11
 
-      - run: uv pip install msgspec pytest pytest-asyncio asyncpg "psycopg[binary]" sqlalchemy greenlet ruff
+      # one source of truth: the dev group in pyproject.toml. A parallel list
+      # here is how the sync-driver tests once arrived without their drivers
+      - run: uv sync --no-install-project --group dev
 
       - run: cargo fmt --check
 
@@ -74,5 +78,49 @@ jobs:
       # cargo test provisions its own databases; the Python suite works
       # against this one and needs the schema put there first
       - run: cargo run -p gylo-cli -- migrate
+
+      - run: PYTHONPATH=python .venv/bin/python -m pytest python -q
+
+  # every interpreter the classifiers claim, not only the floor. The full Rust
+  # suite stays on the floor job; what varies by interpreter is the Python
+  # package, so that is what this matrix runs.
+  python-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: gylo
+          POSTGRES_PASSWORD: gylo
+          POSTGRES_DB: gylo_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      GYLO_TEST_DATABASE_URL: postgres://gylo:gylo@127.0.0.1:5432/gylo_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v5
+
+      - run: uv venv --python ${{ matrix.python }}
+
+      - run: uv sync --no-install-project --group dev
+
+      - run: DATABASE_URL=$GYLO_TEST_DATABASE_URL cargo run -p gylo-cli -- migrate
 
       - run: PYTHONPATH=python .venv/bin/python -m pytest python -q
