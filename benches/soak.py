@@ -142,6 +142,8 @@ async def main() -> int:
                       (SELECT count(*) FROM gylo_job
                         WHERE state = 'available' AND scheduled_at <= now())
                         AS ready,
+                      (SELECT count(*) FROM gylo_job WHERE state <> 'discarded')
+                        AS live_rows,
                       pg_total_relation_size('gylo_job') AS bytes
                     """
                 )
@@ -152,6 +154,7 @@ async def main() -> int:
                         "connections": row["connections"],
                         "running": row["running"],
                         "ready": row["ready"],
+                        "live_rows": row["live_rows"],
                         "bytes": row["bytes"],
                     }
                 )
@@ -230,11 +233,14 @@ async def main() -> int:
                 f"connections still climbing late in the run "
                 f"({early_c:.0f} -> {late_c:.0f}); something is not returning them"
             )
-        early_b, late_b = third(warm, "bytes", 0), third(warm, "bytes", 1)
-        if late_b > early_b * 1.6 + 512 * 1024:
+        # dead letters are retained for days by design, so total bytes grow
+        # linearly for any soak shorter than that window and say nothing.
+        # What must stay flat is everything retention is supposed to bound.
+        early_live, late_live = third(warm, "live_rows", 0), third(warm, "live_rows", 1)
+        if late_live > early_live * 1.5 + 500:
             failures.append(
-                f"table grew {early_b / 1048576:.1f}MB -> {late_b / 1048576:.1f}MB; "
-                f"retention is not keeping pace"
+                f"rows outside the dead-letter class grew {early_live:.0f} -> "
+                f"{late_live:.0f}; retention is not keeping pace"
             )
         backlog = [s["ready"] for s in warm]
         if backlog[-1] > 200:
@@ -248,12 +254,13 @@ async def main() -> int:
     print(f"soak: {DURATION:.0f}s, {len(expected)} jobs, {owed} owed runs")
     if samples:
         head = f"{'t':>6} {'rssMB':>7} {'conns':>6} {'running':>8}"
-        print(head + f" {'ready':>6} {'tableMB':>8}")
+        print(head + f" {'ready':>6} {'live':>6} {'tableMB':>8}")
         step = max(1, len(samples) // 12)
         for s in samples[::step]:
             print(
                 f"{s['at']:>6.0f} {s['rss'] / 1024:>7.0f} {s['connections']:>6} "
-                f"{s['running']:>8} {s['ready']:>6} {s['bytes'] / 1048576:>8.1f}"
+                f"{s['running']:>8} {s['ready']:>6} {s['live_rows']:>6} "
+                f"{s['bytes'] / 1048576:>8.1f}"
             )
     print(f"cron fired {cron_runs} times")
     if failures:
