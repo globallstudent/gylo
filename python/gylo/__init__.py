@@ -443,6 +443,9 @@ class Gylo:
         except KeyError:
             raise UnknownTaskError(name) from None
 
+    def find(self, name: str) -> Task | None:
+        return self._tasks.get(name)
+
     @property
     def names(self) -> frozenset[str]:
         return frozenset(self._tasks)

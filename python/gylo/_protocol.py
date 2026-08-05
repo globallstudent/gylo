@@ -8,6 +8,9 @@ Mirrors `crates/gylo-core/src/protocol.rs`; the two must change together.
     dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
     complete = 0x01 || i64 job_id || u8 outcome || error_utf8
     register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
+    steps    = 0x03 || messagepack [job_id, [[name, result], ..]]
+    record   = 0x04 || messagepack [job_id, name, result]
+    stored   = 0x05 || messagepack [job_id, name]
 
     outcome  = 0x00 success | 0x01 failed, retryable | 0x02 failed, terminal
 """

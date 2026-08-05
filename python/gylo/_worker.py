@@ -148,7 +148,7 @@ async def serve(app: Gylo, socket: str) -> None:
                 acks.resolve(message.id, message.name)
                 continue
 
-            task = app.get(message.task) if message.task in app.names else None
+            task = app.find(message.task)
             context = (
                 StepContext(message.id, replays.pop(message.id, {}), record, confirm)
                 if task is not None and task.durable

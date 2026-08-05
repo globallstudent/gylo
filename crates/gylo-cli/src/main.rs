@@ -160,12 +160,11 @@ struct WorkerArgs {
 /// first, so an activated environment or a system Python shadowing the venv
 /// silently runs task code somewhere the dependencies are not installed.
 fn sibling_python() -> PathBuf {
-    let name = "python3";
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|bin| bin.join(name)))
+        .and_then(|exe| exe.parent().map(|bin| bin.join("python3")))
         .filter(|python| python.is_file())
-        .unwrap_or_else(|| PathBuf::from(name))
+        .unwrap_or_else(|| PathBuf::from("python3"))
 }
 
 /// Stop signals, listened for from the moment this is built.
@@ -282,9 +281,9 @@ async fn show_failed(pool: &PgPool, queue: Option<String>, limit: i64) -> Result
         // one line each, since the point of the listing is to find the id
         // worth looking at rather than to read the tracebacks
         let error = job.error.unwrap_or_else(|| "-".to_owned());
-        let first = error.lines().next_back().unwrap_or("-");
+        let cause = error.lines().next_back().unwrap_or("-");
         println!(
-            "{:<10} {:<16} {:<24} attempt {:<4} {when}  {first}",
+            "{:<10} {:<16} {:<24} attempt {:<4} {when}  {cause}",
             job.id, job.queue, job.task, job.attempt
         );
     }

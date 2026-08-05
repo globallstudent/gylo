@@ -51,20 +51,36 @@ pub enum Outcome {
 ///
 /// `rmp-serde` writes a bare `Vec<u8>` as an array of integers rather than a
 /// MessagePack binary, which the Python side then decodes as a list. The
-/// annotation is what keeps both ends agreeing on bytes.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// annotation is what keeps both ends agreeing on bytes. The `Ref` twins exist
+/// so encoding borrows instead of cloning every name and result first.
+#[derive(Debug, serde::Deserialize)]
 struct WireStep {
     name: String,
     #[serde(with = "serde_bytes")]
     result: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize)]
+struct WireStepRef<'a> {
+    name: &'a str,
+    #[serde(with = "serde_bytes")]
+    result: &'a [u8],
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct WireRecord {
     id: i64,
     name: String,
     #[serde(with = "serde_bytes")]
     result: Vec<u8>,
+}
+
+#[derive(serde::Serialize)]
+struct WireRecordRef<'a> {
+    id: i64,
+    name: &'a str,
+    #[serde(with = "serde_bytes")]
+    result: &'a [u8],
 }
 
 /// A schedule the child declared, sent once when it connects.
@@ -129,8 +145,8 @@ pub enum ProtocolError {
     NotUtf8(&'static str),
     #[error("task name of {0} bytes exceeds the 65535 byte limit")]
     TaskNameTooLong(usize),
-    #[error("registration payload is malformed: {0}")]
-    BadRegistration(String),
+    #[error("messagepack body is malformed: {0}")]
+    Malformed(String),
 }
 
 /// Append `message` to `out` as a complete frame.
@@ -160,21 +176,18 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
             1 + packed.len()
         }
         Message::Steps { id, steps } => {
-            let wire: Vec<WireStep> = steps
+            let wire: Vec<WireStepRef> = steps
                 .iter()
-                .map(|(name, result)| WireStep {
-                    name: name.clone(),
-                    result: result.clone(),
-                })
+                .map(|(name, result)| WireStepRef { name, result })
                 .collect();
             packed = pack(&(id, wire))?;
             1 + packed.len()
         }
         Message::Record { id, name, result } => {
-            packed = pack(&WireRecord {
+            packed = pack(&WireRecordRef {
                 id: *id,
-                name: name.clone(),
-                result: result.clone(),
+                name,
+                result,
             })?;
             1 + packed.len()
         }
@@ -254,11 +267,11 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
 }
 
 fn pack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
-    rmp_serde::to_vec(value).map_err(|error| ProtocolError::BadRegistration(error.to_string()))
+    rmp_serde::to_vec(value).map_err(|error| ProtocolError::Malformed(error.to_string()))
 }
 
 fn unpack<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ProtocolError> {
-    rmp_serde::from_slice(bytes).map_err(|error| ProtocolError::BadRegistration(error.to_string()))
+    rmp_serde::from_slice(bytes).map_err(|error| ProtocolError::Malformed(error.to_string()))
 }
 
 /// Reassembles messages from arbitrarily chunked reads.
@@ -416,7 +429,7 @@ mod tests {
         decoder.extend(&[3, 0, 0, 0, KIND_REGISTER, 0xC1, 0xC1]);
         assert!(matches!(
             decoder.next_message(),
-            Err(ProtocolError::BadRegistration(_))
+            Err(ProtocolError::Malformed(_))
         ));
     }
 

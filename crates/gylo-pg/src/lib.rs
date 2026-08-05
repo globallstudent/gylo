@@ -164,6 +164,10 @@ const KEYED_WAITING: &str = "
 
 /// Jobs carrying a key, admitted against a count that is only trustworthy
 /// because [`ADMISSION_LOCK`] is held for the whole transaction.
+///
+/// The count is taken first and the locked batch then ranked per key, because
+/// Postgres will not accept `FOR UPDATE` beside a window function — the limit
+/// has to be applied in two passes rather than one.
 const FETCH_KEYED: &str = "
     WITH active AS (
         SELECT concurrency_key, count(*) AS running
@@ -203,7 +207,14 @@ const FETCH_KEYED: &str = "
     RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts, j.durable
 ";
 
-const COMPLETE_WITH_RESULTS: &str = "
+/// Finalises a batch and releases whatever depended on it: dependants have
+/// their outstanding count decremented and, at zero, become runnable. Doing
+/// that in the same statement is what makes fan-in safe when several parents
+/// of one child finish at once.
+///
+/// `results` is positional and nullable, so the common batch — tasks that
+/// store nothing — carries NULLs and writes what the column already held.
+const COMPLETE: &str = "
     WITH done AS (
         UPDATE gylo_job j
         SET state = 'completed',
@@ -252,39 +263,6 @@ const RESULT: &str = "
     FROM gylo_job WHERE id = $1
 ";
 
-const COMPLETE_MANY: &str = "
-    WITH done AS (
-        UPDATE gylo_job
-        SET state = 'completed',
-            finalized_at = now(),
-            locked_by = NULL,
-            lease_expires_at = NULL
-        WHERE id = ANY($1) AND locked_by = $2 AND state = 'running'
-        RETURNING id
-    ),
-    counted AS (
-        SELECT e.child, count(*) AS n
-        FROM gylo_edge e JOIN done ON done.id = e.parent
-        GROUP BY e.child
-    ),
-    released AS (
-        UPDATE gylo_job child
-        SET pending_deps = child.pending_deps - counted.n,
-            scheduled_at = CASE
-                WHEN child.pending_deps - counted.n = 0 THEN now()
-                ELSE child.scheduled_at
-            END
-        FROM counted
-        WHERE child.id = counted.child
-        RETURNING child.queue, child.pending_deps
-    ),
-    woken AS (
-        SELECT pg_notify('gylo_available', ready.queue)
-        FROM (SELECT DISTINCT queue FROM released WHERE pending_deps = 0) AS ready
-    )
-    SELECT (SELECT count(*) FROM done) AS settled, (SELECT count(*) FROM woken) AS woken
-";
-
 const DISCARD_MANY: &str = "
     WITH RECURSIVE dead AS (
         UPDATE gylo_job j
@@ -314,20 +292,6 @@ const DISCARD_MANY: &str = "
     )
     SELECT (SELECT count(*) FROM dead) AS settled,
            (SELECT count(*) FROM cancelled) AS cancelled
-";
-
-const DISCARD: &str = "
-    UPDATE gylo_job
-    SET state = 'discarded',
-        finalized_at = now(),
-        locked_by = NULL,
-        lease_expires_at = NULL,
-        errors = errors || jsonb_build_object(
-            'attempt', attempt,
-            'at', now(),
-            'error', $3::text
-        )
-    WHERE id = $1 AND locked_by = $2 AND state = 'running'
 ";
 
 const RECORD_STEP: &str = "
@@ -567,18 +531,6 @@ pub async fn enqueue<'e, E: PgExecutor<'e>>(executor: E, job: &NewJob) -> Result
     Ok(row.try_get("id")?)
 }
 
-/// Leases up to `limit` eligible jobs, skipping rows another worker holds.
-///
-/// A job carrying a concurrency key is admitted only while fewer than
-/// `max_concurrency` of that key are running. The count is taken before
-/// locking and the batch is then ranked per key, because Postgres will not
-/// accept `FOR UPDATE` beside a window function — so the limit has to be
-/// applied in two passes rather than one.
-/// Leases across every named queue in one round trip.
-///
-/// Ordering is global rather than per queue, so a job's priority means the same
-/// thing wherever it was placed. Round-robin between queues would make a high
-/// priority in a quiet queue lose to a low one in a busy neighbour.
 fn job_from(row: &sqlx::postgres::PgRow) -> Result<Job, Error> {
     Ok(Job {
         id: row.try_get("id")?,
@@ -590,12 +542,17 @@ fn job_from(row: &sqlx::postgres::PgRow) -> Result<Job, Error> {
     })
 }
 
-/// Leases up to `limit` jobs, in two passes that cost very differently.
+/// Leases up to `limit` jobs across every named queue, in two passes that
+/// cost very differently.
 ///
 /// The first takes jobs with no key in one statement, which is the whole cost
 /// for a deployment that never uses admission control. The second runs only
 /// when that statement reported keyed work waiting, and pays for a transaction
 /// and a lock to make the count it admits against mean anything.
+///
+/// Ordering is global rather than per queue, so a job's priority means the
+/// same thing wherever it was placed; round-robin between queues would make a
+/// high priority in a quiet queue lose to a low one in a busy neighbour.
 pub async fn fetch(
     pool: &PgPool,
     queues: &[String],
@@ -655,40 +612,29 @@ pub async fn fetch(
     Ok(jobs)
 }
 
-/// Every failure is terminal until retry scheduling exists; this always moves
-/// the job to the dead-letter state rather than back to `available`.
-pub async fn discard<'e, E: PgExecutor<'e>>(
-    executor: E,
-    id: i64,
-    worker: Uuid,
-    error: &str,
-) -> Result<bool, Error> {
-    let result = sqlx::query(DISCARD)
-        .bind(id)
-        .bind(worker)
-        .bind(error)
-        .execute(executor)
-        .await?;
-    Ok(result.rows_affected() == 1)
-}
-
 /// Returns how many were still leased, and so actually finalised. One
 /// statement and one commit, rather than one of each per job.
-///
-/// Completing a job also releases whatever depended on it: dependants have
-/// their outstanding count decremented and, at zero, become runnable. Doing
-/// that in the same statement is what makes fan-in safe when several parents
-/// of one child finish at once.
 pub async fn complete_many<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
     worker: Uuid,
 ) -> Result<u64, Error> {
+    complete(executor, ids, &vec![None; ids.len()], worker).await
+}
+
+async fn complete<'e, E: PgExecutor<'e>>(
+    executor: E,
+    ids: &[i64],
+    results: &[Option<&[u8]>],
+    worker: Uuid,
+) -> Result<u64, Error> {
+    debug_assert_eq!(ids.len(), results.len());
     if ids.is_empty() {
         return Ok(0);
     }
-    let row = sqlx::query(COMPLETE_MANY)
+    let row = sqlx::query(COMPLETE)
         .bind(ids)
+        .bind(results)
         .bind(worker)
         .fetch_one(executor)
         .await?;
@@ -841,26 +787,16 @@ pub async fn fire_cron<'e, E: PgExecutor<'e>>(
         .map_err(Error::from)
 }
 
-/// Finalises jobs that produced a return value, storing each alongside its own
-/// job. Kept separate from [`complete_many`] so the common case — a task that
-/// stores nothing — does not carry an array of nulls.
+/// [`complete_many`] for jobs that produced a return value, storing each
+/// alongside its own job.
 pub async fn complete_many_with_results<'e, E: PgExecutor<'e>>(
     executor: E,
     ids: &[i64],
     results: &[Vec<u8>],
     worker: Uuid,
 ) -> Result<u64, Error> {
-    debug_assert_eq!(ids.len(), results.len());
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let row = sqlx::query(COMPLETE_WITH_RESULTS)
-        .bind(ids)
-        .bind(results)
-        .bind(worker)
-        .fetch_one(executor)
-        .await?;
-    Ok(row.try_get::<i64, _>("settled")? as u64)
+    let results: Vec<Option<&[u8]>> = results.iter().map(|r| Some(r.as_slice())).collect();
+    complete(executor, ids, &results, worker).await
 }
 
 /// Cancels jobs that have not started, returning how many were still waiting.
@@ -963,10 +899,10 @@ const DEPTH: &str = "
 pub async fn depth<'e, E: PgExecutor<'e>>(executor: E, queue: &str) -> Result<Depth, Error> {
     let row = sqlx::query(DEPTH).bind(queue).fetch_one(executor).await?;
     Ok(Depth {
-        ready: row.get("ready"),
-        scheduled: row.get("scheduled"),
-        blocked: row.get("blocked"),
-        running: row.get("running"),
+        ready: row.try_get("ready")?,
+        scheduled: row.try_get("scheduled")?,
+        blocked: row.try_get("blocked")?,
+        running: row.try_get("running")?,
     })
 }
 
@@ -977,7 +913,7 @@ pub struct Discarded {
     pub queue: String,
     pub task: String,
     pub attempt: i16,
-    pub finalized_at: Option<chrono::DateTime<Utc>>,
+    pub finalized_at: Option<DateTime<Utc>>,
     /// The last one only. The whole history is on the row for anyone who needs
     /// it, and a listing that printed every attempt would bury the failure.
     pub error: Option<String>,
@@ -1002,17 +938,18 @@ pub async fn list_discarded<'e, E: PgExecutor<'e>>(
         .bind(limit)
         .fetch_all(executor)
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| Discarded {
-            id: row.get("id"),
-            queue: row.get("queue"),
-            task: row.get("task"),
-            attempt: row.get("attempt"),
-            finalized_at: row.get("finalized_at"),
-            error: row.get("error"),
+    rows.into_iter()
+        .map(|row| {
+            Ok(Discarded {
+                id: row.try_get("id")?,
+                queue: row.try_get("queue")?,
+                task: row.try_get("task")?,
+                attempt: row.try_get("attempt")?,
+                finalized_at: row.try_get("finalized_at")?,
+                error: row.try_get("error")?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Returns dead-lettered jobs to the queue with their attempts reset.
@@ -1044,7 +981,9 @@ pub async fn retry_discarded<'e, E: PgExecutor<'e>>(
         .bind(queue)
         .fetch_all(executor)
         .await?;
-    Ok(rows.into_iter().map(|row| row.get("id")).collect())
+    rows.into_iter()
+        .map(|row| row.try_get("id").map_err(Error::from))
+        .collect()
 }
 
 const PURGE_DISCARDED: &str = "
@@ -1071,7 +1010,9 @@ const QUEUE_NAMES: &str = "
 
 pub async fn queues<'e, E: PgExecutor<'e>>(executor: E) -> Result<Vec<String>, Error> {
     let rows = sqlx::query(QUEUE_NAMES).fetch_all(executor).await?;
-    Ok(rows.into_iter().map(|row| row.get("queue")).collect())
+    rows.into_iter()
+        .map(|row| row.try_get("queue").map_err(Error::from))
+        .collect()
 }
 
 /// Deletes finished jobs older than the window, oldest first.

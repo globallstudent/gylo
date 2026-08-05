@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use gylo_pg::{NewJob, complete_many, discard, discard_many, enqueue, fetch, reclaim_expired};
+use gylo_pg::{NewJob, complete_many, discard_many, enqueue, fetch, reclaim_expired};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -144,7 +144,12 @@ async fn discarding_records_the_attempt_history(pool: PgPool) {
         .await
         .unwrap();
 
-    assert!(discard(&pool, id, me, "ValueError: nope").await.unwrap());
+    assert_eq!(
+        discard_many(&pool, &[id], &["ValueError: nope".to_owned()], me)
+            .await
+            .unwrap(),
+        1
+    );
     assert_eq!(state_of(&pool, id).await, "discarded");
 
     let errors: serde_json::Value = sqlx::query("SELECT errors FROM gylo_job WHERE id = $1")
@@ -921,7 +926,9 @@ async fn dead_letter(pool: &PgPool, queue: &str, error: &str) -> i64 {
     fetch(pool, &queues(queue), 10, LEASE, holder)
         .await
         .unwrap();
-    discard(pool, id, holder, error).await.unwrap();
+    discard_many(pool, &[id], &[error.to_owned()], holder)
+        .await
+        .unwrap();
     id
 }
 

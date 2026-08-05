@@ -595,7 +595,7 @@ async fn retain(pool: PgPool, config: Config, shutdown: CancellationToken) {
     }
 }
 
-/// Fires due schedules and recovers leases whose worker died./// Fires due schedules and recovers leases whose worker died.
+/// Fires due schedules and recovers leases whose worker died.
 ///
 /// Once per worker process rather than once per child: both are queue-wide, so
 /// running them per child would multiply the work without finding anything a
@@ -706,6 +706,20 @@ struct Dispatching<'a> {
     shutdown: &'a CancellationToken,
 }
 
+async fn forward_ack(
+    writer: &mut OwnedWriteHalf,
+    buf: &mut Vec<u8>,
+    ack: Option<Message>,
+) -> Result<(), Error> {
+    if let Some(ack) = ack {
+        buf.clear();
+        if encode(&ack, buf).is_ok() {
+            writer.write_all(buf).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn dispatch(
     mut writer: OwnedWriteHalf,
     context: Dispatching<'_>,
@@ -724,23 +738,13 @@ async fn dispatch(
 
     while !shutdown.is_cancelled() {
         while let Ok(ack) = acks.try_recv() {
-            buf.clear();
-            if encode(&ack, &mut buf).is_ok() {
-                writer.write_all(&buf).await?;
-            }
+            forward_ack(&mut writer, &mut buf, Some(ack)).await?;
         }
 
         let available = inflight.available();
         if available == 0 {
             tokio::select! {
-                ack = acks.recv() => {
-                    if let Some(ack) = ack {
-                        buf.clear();
-                        if encode(&ack, &mut buf).is_ok() {
-                            writer.write_all(&buf).await?;
-                        }
-                    }
-                }
+                ack = acks.recv() => forward_ack(&mut writer, &mut buf, ack).await?,
                 () = inflight.freed.notified() => {}
                 () = shutdown.cancelled() => break,
             }
@@ -765,14 +769,7 @@ async fn dispatch(
 
         if jobs.is_empty() {
             tokio::select! {
-                ack = acks.recv() => {
-                    if let Some(ack) = ack {
-                        buf.clear();
-                        if encode(&ack, &mut buf).is_ok() {
-                            writer.write_all(&buf).await?;
-                        }
-                    }
-                }
+                ack = acks.recv() => forward_ack(&mut writer, &mut buf, ack).await?,
                 () = wakeup.notified() => {}
                 () = tokio::time::sleep(config.poll_interval) => {}
                 () = shutdown.cancelled() => break,
@@ -806,8 +803,11 @@ async fn dispatch(
                 Ok(()) => reserved.push(id),
                 Err(error) => {
                     tracing::error!(job = id, %error, "job could not be encoded, discarding");
+                    // the batched path rather than a one-row update, because it
+                    // cascade-cancels descendants: an unencodable workflow
+                    // parent must not strand its graph waiting forever
                     if let Err(error) =
-                        gylo_pg::discard(&pool, id, worker, &error.to_string()).await
+                        gylo_pg::discard_many(&pool, &[id], &[error.to_string()], worker).await
                     {
                         tracing::error!(job = id, %error, "discarding the job failed");
                     }

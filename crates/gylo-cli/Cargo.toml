@@ -15,15 +15,15 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 clap = { version = "4.6.5", features = ["derive", "env"] }
 dotenvy = "0.15.7"
-gylo-pg = { version = "0.1.0", path = "../gylo-pg" }
-gylo-worker = { version = "0.1.0", path = "../gylo-worker" }
+gylo-pg.workspace = true
+gylo-worker.workspace = true
 humantime = "2.4.0"
 # default features drag in an HTTP listener and push gateway on hyper-rustls,
 # whose aws-lc-rs backend needs a C toolchain that cross-compilation for
 # aarch64 does not have. The recorder and its renderer are all we use.
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio"] }
-tokio = { version = "1.53.1", features = ["full"] }
-tokio-util = "0.7.19"
-tracing = "0.1.44"
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
