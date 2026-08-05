@@ -27,6 +27,8 @@ a process that looks healthy at zero capacity.
 | `--concurrency` | 256 | in-flight jobs per child; how far ahead of it the supervisor leases |
 | `--batch` | 128 | jobs leased per round trip — bounded for crash-recovery latency, not speed |
 | `--lease` | 30s | how long a dead worker's jobs wait before another recovers them |
+| `--retry-base` | 1s | delay before the first retry; doubles each attempt, with jitter |
+| `--retry-cap` | 1h | ceiling the retry backoff never exceeds |
 | `--retain-completed` | 24h | finished-job (and result) lifetime — see below |
 | `--retain-discarded` | 7d | dead-letter lifetime |
 

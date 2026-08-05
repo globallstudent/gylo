@@ -18,10 +18,11 @@ decode.
 
 ## Backoff
 
-Retries reschedule with exponential backoff — `retry_base` (1s) doubling per
-attempt up to `retry_cap` (1h) — with 50–100% jitter, so a burst of
-simultaneous failures does not return as a synchronised thundering herd. The
-delay is computed in the database from the job's own attempt count.
+Retries reschedule with exponential backoff — `--retry-base` (1s) doubling
+per attempt up to `--retry-cap` (1h), both worker flags — with 50–100%
+jitter, so a burst of simultaneous failures does not return as a synchronised
+thundering herd. The delay is computed in the database from the job's own
+attempt count.
 
 After `max_attempts` (default 20), the job dead-letters with its complete
 error history — every attempt's traceback, timestamped, on the row. See

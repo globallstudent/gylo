@@ -125,6 +125,14 @@ struct WorkerArgs {
     #[arg(long, default_value = "10s")]
     maintenance_interval: humantime::Duration,
 
+    /// Delay before the first retry; it doubles each attempt, with jitter.
+    #[arg(long, default_value = "1s")]
+    retry_base: humantime::Duration,
+
+    /// Ceiling the retry backoff never exceeds.
+    #[arg(long, default_value = "1h")]
+    retry_cap: humantime::Duration,
+
     /// How long finished jobs and their results are kept before maintenance
     /// deletes them.
     #[arg(long, default_value = "24h")]
@@ -399,6 +407,8 @@ async fn main() -> Result<()> {
                 lease,
                 poll_interval,
                 maintenance_interval,
+                retry_base,
+                retry_cap,
                 retain_completed,
                 retain_discarded,
                 python,
@@ -429,6 +439,8 @@ async fn main() -> Result<()> {
                 lease: lease.into(),
                 poll_interval: poll_interval.into(),
                 maintenance_interval: maintenance_interval.into(),
+                retry_base: retry_base.into(),
+                retry_cap: retry_cap.into(),
                 retain_completed: retain_completed.into(),
                 retain_discarded: retain_discarded.into(),
                 python: python.unwrap_or_else(sibling_python),
