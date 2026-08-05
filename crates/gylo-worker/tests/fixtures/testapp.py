@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -177,3 +178,25 @@ def guarded(job: int) -> None:
     note("start")
     time.sleep(0.05)
     note("end")
+
+
+@app.task(name="many_steps", durable=True)
+async def many_steps(ctx) -> None:
+    """Hundreds of ack round trips, to push the bounded channel hard."""
+    for n in range(600):
+
+        async def step(n: int = n) -> int:
+            return n
+
+        await ctx.step(f"s{n}", step)
+
+
+@app.task(name="shouts")
+async def shouts() -> None:
+    """One enormous stderr line with no newline until the very end.
+
+    The supervisor holds a line until its newline arrives, so this is the
+    input that would grow that buffer without limit if it were unbounded.
+    """
+    sys.stderr.write("x" * (8 * 1024 * 1024) + "\n")
+    sys.stderr.flush()

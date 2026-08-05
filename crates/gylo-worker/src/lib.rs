@@ -15,7 +15,7 @@ mod observe;
 use chrono::Utc;
 use gylo_core::{Decoder, Message, Outcome, Schedule, encode};
 use sqlx::PgPool;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const READ_BUFFER: usize = 1 << 16;
+const ACK_CAPACITY: usize = 256;
+const LINE_CAP: usize = 8 * 1024;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const LISTEN_RETRY: Duration = Duration::from_secs(1);
 const RESTART_DELAY: Duration = Duration::from_millis(250);
@@ -414,7 +416,12 @@ async fn session(
     };
     let (reader, writer) = accepted.0.into_split();
 
-    let (acks, ack_rx) = tokio::sync::mpsc::unbounded_channel();
+    // bounded so a torrent of step records cannot pile acks without limit:
+    // a full channel makes the completion reader wait, which slows the child's
+    // step recording — backpressure, where an unbounded queue would be growth.
+    // The child's own read loop never blocks on writing, so the dispatcher
+    // always drains this and the cycle cannot deadlock.
+    let (acks, ack_rx) = tokio::sync::mpsc::channel(ACK_CAPACITY);
     let completions = tokio::spawn(collect_completions(
         reader,
         pool.clone(),
@@ -702,7 +709,7 @@ struct Dispatching<'a> {
 async fn dispatch(
     mut writer: OwnedWriteHalf,
     context: Dispatching<'_>,
-    mut acks: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    mut acks: tokio::sync::mpsc::Receiver<Message>,
 ) -> Result<(), Error> {
     let Dispatching {
         pool,
@@ -917,7 +924,7 @@ async fn collect_completions(
     inflight: Arc<InFlight>,
     config: Config,
     worker: Uuid,
-    acks: tokio::sync::mpsc::UnboundedSender<Message>,
+    acks: tokio::sync::mpsc::Sender<Message>,
 ) {
     let batch = config.completion_batch;
     let linger = config.completion_linger;
@@ -960,7 +967,7 @@ async fn collect_completions(
                         Ok(Some(Message::Record { id, name, result })) => {
                             match gylo_pg::record_step(&pool, id, &name, &result).await {
                                 Ok(()) => {
-                                    let _ = acks.send(Message::Stored { id, name });
+                                    let _ = acks.send(Message::Stored { id, name }).await;
                                 }
                                 Err(error) => {
                                     tracing::error!(job = id, step = %name, %error,
@@ -1048,16 +1055,47 @@ impl LastWords {
     fn watch(&self, stderr: tokio::process::ChildStderr) {
         let lines = Arc::clone(&self.0);
         tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                tracing::warn!(target: "gylo::child", "{line}");
-                let mut held = lines.lock().expect("child output is not poisoned");
-                if held.len() == LAST_WORDS {
-                    held.pop_front();
+            let mut stderr = stderr;
+            let mut chunk = [0u8; 4096];
+            let mut line: Vec<u8> = Vec::new();
+            let mut truncated = false;
+            loop {
+                let read = match stderr.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                for &byte in &chunk[..read] {
+                    if byte == b'\n' {
+                        Self::emit(&lines, &mut line, &mut truncated);
+                    } else if line.len() < LINE_CAP {
+                        line.push(byte);
+                    } else {
+                        // a line is held until its newline arrives, so a task
+                        // dumping one endless line would otherwise grow this
+                        // without limit; the tail is dropped and marked
+                        truncated = true;
+                    }
                 }
-                held.push_back(line);
+            }
+            if !line.is_empty() {
+                Self::emit(&lines, &mut line, &mut truncated);
             }
         });
+    }
+
+    fn emit(lines: &Arc<Mutex<VecDeque<String>>>, line: &mut Vec<u8>, truncated: &mut bool) {
+        let mut rendered = String::from_utf8_lossy(line).into_owned();
+        if *truncated {
+            rendered.push_str(" [truncated]");
+        }
+        tracing::warn!(target: "gylo::child", "{rendered}");
+        let mut held = lines.lock().expect("child output is not poisoned");
+        if held.len() == LAST_WORDS {
+            held.pop_front();
+        }
+        held.push_back(rendered);
+        line.clear();
+        *truncated = false;
     }
 
     fn tail(&self) -> String {

@@ -1049,3 +1049,41 @@ async fn retention_is_enforced_while_the_worker_runs(pool: PgPool) {
     shutdown.cancel();
     worker.await.unwrap().expect("worker failed");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn hundreds_of_step_acks_flow_through_the_bounded_channel(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("many_steps", payload(&[], &[])))
+        .await
+        .unwrap();
+
+    run_until_settled(&pool).await;
+
+    assert_eq!(state_of(&pool, id).await, "completed");
+    let recorded: i64 = sqlx::query("SELECT count(*) FROM gylo_step WHERE job_id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        recorded, 600,
+        "every ack must flow: a bound that loses or deadlocks acks would \
+         strand the task waiting on a confirmation that never comes"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_endless_stderr_line_cannot_grow_the_supervisor(pool: PgPool) {
+    let id = enqueue(&pool, &NewJob::new("shouts", Vec::new()))
+        .await
+        .unwrap();
+
+    run_until_settled(&pool).await;
+
+    assert_eq!(
+        state_of(&pool, id).await,
+        "completed",
+        "eight megabytes of stderr without a newline is data, not a failure; \
+         the supervisor keeps a capped line and drops the rest"
+    );
+}
