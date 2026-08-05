@@ -8,15 +8,22 @@ runs here.
 The statements are generated rather than written out. The column list has grown
 several times, and hand-numbering `$1` through `$10` twice per driver is a
 defect waiting to happen.
+
+Synchronous connections get their own adapter and their own entry points,
+because most production Python is still synchronous and a queue that only
+speaks `await` excludes it. SQLAlchemy and Django connections are unwrapped to
+the driver connection underneath, which shares their transaction — the insert
+still commits or rolls back with the caller's own work.
 """
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Protocol
 
 import msgspec
 
-__all__ = ["UnsupportedDriverError", "adapter_for"]
+__all__ = ["UnsupportedDriverError", "WrongFlavourError", "resolve"]
 
 _COLUMNS = (
     "queue",
@@ -36,6 +43,10 @@ _LIVE = "state IN ('available', 'running')"
 
 class UnsupportedDriverError(TypeError):
     """No adapter recognises the given connection object."""
+
+
+class WrongFlavourError(TypeError):
+    """A sync connection reached the async API, or the other way around."""
 
 
 def _statements(marks: list[str]) -> tuple[str, str, str, str, str]:
@@ -92,7 +103,68 @@ _NEW_WORKFLOW = "INSERT INTO gylo_workflow DEFAULT VALUES RETURNING id"
 _NEW_EDGE = "INSERT INTO gylo_edge (workflow_id, parent, child) VALUES ($1, $2, $3)"
 
 
+class SyncPsycopgAdapter:
+    IS_ASYNC = False
+    INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
+        ["%s"] * (len(_COLUMNS) + 2)
+    )
+    INSERT_NODE = _node_statement(numbered=False)
+    NEW_EDGE = _NEW_EDGE.replace("$1", "%s").replace("$2", "%s").replace("$3", "%s")
+
+    @classmethod
+    def insert(cls, conn: Any, params: tuple[Any, ...]) -> int:
+        with conn.cursor() as cursor:
+            cursor.execute(cls.INSERT, params)
+            return cursor.fetchone()[0]
+
+    @classmethod
+    def insert_unique(cls, conn: Any, params: tuple[Any, ...]) -> int:
+        with conn.cursor() as cursor:
+            cursor.execute(cls.INSERT_UNIQUE, (*params, params[-1]))
+            return cursor.fetchone()[0]
+
+    @classmethod
+    def insert_many(
+        cls, conn: Any, rows: list[tuple[Any, ...]], *, unique: bool
+    ) -> None:
+        with conn.cursor() as cursor:
+            cursor.executemany(cls.INSERT_MANY_UNIQUE if unique else cls.INSERT, rows)
+
+    @classmethod
+    def outcome(cls, conn: Any, job_id: int) -> tuple[str, bytes | None, Any] | None:
+        with conn.cursor() as cursor:
+            cursor.execute(cls.OUTCOME, (job_id,))
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return row[0], row[1], row[2] or []
+
+    @classmethod
+    def cancel(cls, conn: Any, job_ids: list[int]) -> int:
+        with conn.cursor() as cursor:
+            cursor.execute(cls.CANCEL, (job_ids,))
+            return cursor.rowcount
+
+    @classmethod
+    def insert_workflow(
+        cls, conn: Any, nodes: list[tuple[Any, ...]], edges: list[tuple[int, int]]
+    ) -> list[int]:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(_NEW_WORKFLOW)
+            workflow = cursor.fetchone()[0]
+            ids = []
+            for node in nodes:
+                cursor.execute(cls.INSERT_NODE, (workflow, *node))
+                ids.append(cursor.fetchone()[0])
+            if edges:
+                cursor.executemany(
+                    cls.NEW_EDGE, [(workflow, ids[p], ids[c]) for p, c in edges]
+                )
+        return ids
+
+
 class Adapter(Protocol):
+    IS_ASYNC: bool
     INSERT: str
     INSERT_UNIQUE: str
     INSERT_MANY_UNIQUE: str
@@ -125,6 +197,7 @@ class Adapter(Protocol):
 
 
 class AsyncpgAdapter:
+    IS_ASYNC = True
     INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
         [f"${n}" for n in range(1, len(_COLUMNS) + 2)]
     )
@@ -181,6 +254,7 @@ class AsyncpgAdapter:
 
 
 class PsycopgAdapter:
+    IS_ASYNC = True
     INSERT, INSERT_UNIQUE, INSERT_MANY_UNIQUE, OUTCOME, CANCEL = _statements(
         ["%s"] * (len(_COLUMNS) + 2)
     )
@@ -245,23 +319,55 @@ class PsycopgAdapter:
         return ids
 
 
-_BY_MODULE: dict[str, type[Adapter]] = {
-    "asyncpg": AsyncpgAdapter,
-    "psycopg": PsycopgAdapter,
+def _psycopg_flavour(conn: Any) -> type[Adapter]:
+    # one module ships both flavours; what tells them apart is whether
+    # execute is a coroutine function
+    if inspect.iscoroutinefunction(type(conn).execute):
+        return PsycopgAdapter
+    return SyncPsycopgAdapter
+
+
+def _unwrap(conn: Any) -> Any:
+    """The driver connection under an ORM's wrapper.
+
+    Writing on it lands inside the wrapper's own transaction, because it is
+    the same wire connection — the insert still commits or rolls back with
+    the caller's other work.
+    """
+    root = type(conn).__module__.split(".", 1)[0]
+    if root == "sqlalchemy":
+        sync = getattr(conn, "sync_connection", None) or conn
+        fairy = getattr(sync, "connection", None)
+        driver = getattr(fairy, "driver_connection", None)
+        if driver is not None:
+            return driver
+    if root == "django":
+        driver = getattr(conn, "connection", None)
+        if driver is not None:
+            return driver
+    return conn
+
+
+_BY_MODULE: dict[str, Any] = {
+    "asyncpg": lambda _conn: AsyncpgAdapter,
+    "psycopg": _psycopg_flavour,
 }
 
 
-def adapter_for(conn: Any) -> type[Adapter]:
-    """Pick an adapter from the connection's own module.
+def resolve(conn: Any) -> tuple[type[Adapter], Any]:
+    """The adapter for a connection, and the connection to actually use.
 
     Matching on the module rather than the exact class keeps pools, connection
     proxies, and driver subclasses working without an explicit registry entry
-    for each.
+    for each. A SQLAlchemy or Django wrapper is unwrapped to the driver
+    connection underneath, and that unwrapped connection is what the adapter
+    must be handed — the wrapper does not speak the driver's own methods.
     """
+    conn = _unwrap(conn)
     for base in type(conn).__mro__:
         root = base.__module__.split(".", 1)[0]
         if root in _BY_MODULE:
-            return _BY_MODULE[root]
+            return _BY_MODULE[root](conn), conn
     raise UnsupportedDriverError(
         f"no gylo adapter for {type(conn).__module__}.{type(conn).__qualname__}; "
         f"supported drivers are {', '.join(sorted(_BY_MODULE))}"

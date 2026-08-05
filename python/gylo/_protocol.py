@@ -5,7 +5,8 @@ Mirrors `crates/gylo-core/src/protocol.rs`; the two must change together.
     frame    = u32 body_len (LE) || body
     body     = u8 kind || kind-specific
 
-    dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
+    dispatch = 0x00 || i64 job_id || i16 attempt || i16 max_attempts
+                    || u16 task_len || task_utf8 || payload
     complete = 0x01 || i64 job_id || u8 outcome || error_utf8
     register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
     steps    = 0x03 || messagepack [job_id, [[name, result], ..]]
@@ -36,9 +37,21 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 _LENGTH = struct.Struct("<I")
 _COMPLETE = struct.Struct("<IBqB")
-_DISPATCH_HEAD = struct.Struct("<qH")
+_DISPATCH_HEAD = struct.Struct("<qhhH")
 _COMPLETE_BODY_BYTES = 10
-_DISPATCH_HEAD_BYTES = 11
+_DISPATCH_HEAD_BYTES = 15
+
+
+def payload_limit(task: str) -> int:
+    """Largest payload the supervisor will ever be able to dispatch.
+
+    Checked at enqueue because the alternative is worse: an oversized payload
+    inserts fine and then dead-letters at dispatch, long after the caller who
+    could have fixed it has moved on.
+    """
+    return MAX_FRAME_BYTES - _DISPATCH_HEAD_BYTES - len(task.encode())
+
+
 MAX_ERROR_BYTES = 64 * 1024
 
 
@@ -49,6 +62,8 @@ class ProtocolError(Exception):
 @dataclass(frozen=True, slots=True)
 class Dispatch:
     id: int
+    attempt: int
+    max_attempts: int
     task: str
     payload: bytes
 
@@ -154,8 +169,10 @@ class Decoder:
             if body_len < _DISPATCH_HEAD_BYTES:
                 raise ProtocolError("frame body is truncated")
 
-            job_id, name_len = _DISPATCH_HEAD.unpack_from(buf, body + 1)
-            name_at = body + 11
+            job_id, attempt, max_attempts, name_len = _DISPATCH_HEAD.unpack_from(
+                buf, body + 1
+            )
+            name_at = body + _DISPATCH_HEAD_BYTES
             payload_at = name_at + name_len
             if payload_at > end:
                 raise ProtocolError("frame body is truncated")
@@ -163,6 +180,8 @@ class Decoder:
             out.append(
                 Dispatch(
                     id=job_id,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
                     task=bytes(buf[name_at:payload_at]).decode("utf-8"),
                     payload=bytes(buf[payload_at:end]),
                 )

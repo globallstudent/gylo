@@ -200,3 +200,10 @@ async def shouts() -> None:
     """
     sys.stderr.write("x" * (8 * 1024 * 1024) + "\n")
     sys.stderr.flush()
+
+
+@app.task(name="aware", context=True)
+async def aware(ctx) -> None:
+    """Succeeds only on its final attempt, provable solely via the context."""
+    if not ctx.final:
+        raise RuntimeError(f"attempt {ctx.attempt} of {ctx.max_attempts}, not yet")

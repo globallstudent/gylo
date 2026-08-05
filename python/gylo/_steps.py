@@ -19,7 +19,7 @@ import msgspec
 class StepContext:
     """Passed as the first argument to a task registered with `durable=True`."""
 
-    __slots__ = ("_ack", "_completed", "_job_id", "_record")
+    __slots__ = ("_ack", "_completed", "_record", "attempt", "job_id", "max_attempts")
 
     def __init__(
         self,
@@ -27,11 +27,20 @@ class StepContext:
         completed: dict[str, bytes],
         record: Callable[[int, str, bytes], None],
         ack: Callable[[int, str], Any],
+        attempt: int = 0,
+        max_attempts: int = 0,
     ) -> None:
-        self._job_id = job_id
+        self.job_id = job_id
         self._completed = completed
         self._record = record
         self._ack = ack
+        self.attempt = attempt
+        self.max_attempts = max_attempts
+
+    @property
+    def final(self) -> bool:
+        """Whether this is the last attempt the job will get."""
+        return self.attempt >= self.max_attempts
 
     async def step(self, name: str, work: Callable[[], Any]) -> Any:
         """Run `work` once, or return what it returned on an earlier attempt.
@@ -48,8 +57,8 @@ class StepContext:
             result = await result
 
         encoded = msgspec.msgpack.encode(result)
-        self._record(self._job_id, name, encoded)
-        await self._ack(self._job_id, name)
+        self._record(self.job_id, name, encoded)
+        await self._ack(self.job_id, name)
         self._completed[name] = encoded
         return result
 

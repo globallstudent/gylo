@@ -16,7 +16,7 @@ from typing import Any
 
 import msgspec
 
-from . import Gylo, Task, UnknownTaskError
+from . import Gylo, JobContext, Task, UnknownTaskError
 from ._protocol import (
     Decoder,
     Dispatch,
@@ -71,6 +71,8 @@ async def _call(
         if context is not None:
             return await task.fn(context, *args, **kwargs)
         return await task.fn(*args, **kwargs)
+    if context is not None:
+        return await asyncio.to_thread(task.fn, context, *args, **kwargs)
     return await asyncio.to_thread(task.fn, *args, **kwargs)
 
 
@@ -78,7 +80,7 @@ async def _execute(
     app: Gylo,
     message: Dispatch,
     writer: asyncio.StreamWriter,
-    context: StepContext | None,
+    context: StepContext | JobContext | None,
 ) -> None:
     """Run one job and report how it went.
 
@@ -149,11 +151,18 @@ async def serve(app: Gylo, socket: str) -> None:
                 continue
 
             task = app.find(message.task)
-            context = (
-                StepContext(message.id, replays.pop(message.id, {}), record, confirm)
-                if task is not None and task.durable
-                else None
-            )
+            context: StepContext | JobContext | None = None
+            if task is not None and task.durable:
+                context = StepContext(
+                    message.id,
+                    replays.pop(message.id, {}),
+                    record,
+                    confirm,
+                    message.attempt,
+                    message.max_attempts,
+                )
+            elif task is not None and task.wants_context:
+                context = JobContext(message.id, message.attempt, message.max_attempts)
             job = asyncio.ensure_future(_execute(app, message, writer, context))
             running.add(job)
             job.add_done_callback(running.discard)

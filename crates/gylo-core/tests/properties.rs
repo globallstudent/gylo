@@ -51,11 +51,22 @@ fn message() -> impl Strategy<Value = Message> {
             result
         }),
         (any::<i64>(), name()).prop_map(|(id, name)| Message::Stored { id, name }),
-        (any::<i64>(), name(), small_bytes()).prop_map(|(id, task, payload)| Message::Dispatch {
-            id,
-            task,
-            payload
-        }),
+        (
+            any::<i64>(),
+            any::<i16>(),
+            any::<i16>(),
+            name(),
+            small_bytes()
+        )
+            .prop_map(
+                |(id, attempt, max_attempts, task, payload)| Message::Dispatch {
+                    id,
+                    attempt,
+                    max_attempts,
+                    task,
+                    payload
+                }
+            ),
         (any::<i64>(), outcome()).prop_map(|(id, outcome)| Message::Complete { id, outcome }),
     ]
 }
@@ -160,6 +171,8 @@ proptest! {
 
         let rejected = Message::Dispatch {
             id: 1,
+            attempt: 1,
+            max_attempts: 1,
             task: "x".repeat(usize::from(u16::MAX) + 1),
             payload: Vec::new(),
         };

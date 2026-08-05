@@ -8,7 +8,7 @@
 //! frame    = u32 body_len (LE) || body
 //! body     = u8 kind || kind-specific
 //!
-//! dispatch = 0x00 || i64 job_id || u16 task_len || task_utf8 || payload
+//! dispatch = 0x00 || i64 job_id || i16 attempt || i16 max_attempts || u16 task_len || task_utf8 || payload
 //! complete = 0x01 || i64 job_id || u8 outcome || error_utf8
 //! register = 0x02 || messagepack [[name, queue, task, expr, tz, payload], ..]
 //! steps    = 0x03 || messagepack [job_id, [[name, result], ..]]
@@ -120,8 +120,12 @@ pub enum Message {
         id: i64,
         name: String,
     },
+    /// `attempt` and `max_attempts` ride along so a task can see where it
+    /// stands — alert on the final attempt instead of retrying into the void.
     Dispatch {
         id: i64,
+        attempt: i16,
+        max_attempts: i16,
         task: String,
         payload: Vec<u8>,
     },
@@ -165,7 +169,7 @@ pub fn encode(message: &Message, out: &mut Vec<u8>) -> Result<(), ProtocolError>
     }
 }
 
-const DISPATCH_HEAD_BYTES: usize = 1 + 8 + 2;
+const DISPATCH_HEAD_BYTES: usize = 1 + 8 + 2 + 2 + 2;
 const COMPLETE_HEAD_BYTES: usize = 1 + 8 + 1;
 
 fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<(), ProtocolError> {
@@ -233,11 +237,19 @@ fn encode_frame(message: &Message, out: &mut Vec<u8>, start: usize) -> Result<()
             out.push(KIND_STORED);
             out.extend_from_slice(&packed);
         }
-        Message::Dispatch { id, task, payload } => {
+        Message::Dispatch {
+            id,
+            attempt,
+            max_attempts,
+            task,
+            payload,
+        } => {
             let name_len = u16::try_from(task.len())
                 .map_err(|_| ProtocolError::TaskNameTooLong(task.len()))?;
             out.push(KIND_DISPATCH);
             out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&attempt.to_le_bytes());
+            out.extend_from_slice(&max_attempts.to_le_bytes());
             out.extend_from_slice(&name_len.to_le_bytes());
             out.extend_from_slice(task.as_bytes());
             out.extend_from_slice(payload);
@@ -326,13 +338,16 @@ fn decode_body(body: &[u8]) -> Result<Message, ProtocolError> {
     let (&kind, rest) = body.split_first().ok_or(ProtocolError::Truncated)?;
     match kind {
         KIND_DISPATCH => {
-            if rest.len() < 10 {
+            if rest.len() < 14 {
                 return Err(ProtocolError::Truncated);
             }
             let id = i64::from_le_bytes(rest[..8].try_into().expect("slice is 8 long"));
+            let attempt = i16::from_le_bytes(rest[8..10].try_into().expect("slice is 2 long"));
+            let max_attempts =
+                i16::from_le_bytes(rest[10..12].try_into().expect("slice is 2 long"));
             let name_len =
-                u16::from_le_bytes(rest[8..10].try_into().expect("slice is 2 long")) as usize;
-            let rest = &rest[10..];
+                u16::from_le_bytes(rest[12..14].try_into().expect("slice is 2 long")) as usize;
+            let rest = &rest[14..];
             if rest.len() < name_len {
                 return Err(ProtocolError::Truncated);
             }
@@ -341,6 +356,8 @@ fn decode_body(body: &[u8]) -> Result<Message, ProtocolError> {
                 .to_owned();
             Ok(Message::Dispatch {
                 id,
+                attempt,
+                max_attempts,
                 task,
                 payload: rest[name_len..].to_vec(),
             })
@@ -399,6 +416,8 @@ mod tests {
     fn dispatch() -> Message {
         Message::Dispatch {
             id: -42,
+            attempt: 3,
+            max_attempts: 20,
             task: "billing.charge".to_owned(),
             payload: vec![0x93, 0x01, 0x02, 0x03],
         }
@@ -546,6 +565,8 @@ mod tests {
     fn empty_payload_and_task_survive() {
         let message = Message::Dispatch {
             id: 0,
+            attempt: 0,
+            max_attempts: 0,
             task: String::new(),
             payload: Vec::new(),
         };
@@ -637,6 +658,8 @@ mod tests {
     fn task_name_over_u16_is_rejected() {
         let message = Message::Dispatch {
             id: 1,
+            attempt: 1,
+            max_attempts: 1,
             task: "x".repeat(65_536),
             payload: Vec::new(),
         };
@@ -656,6 +679,8 @@ mod tests {
 
         let oversized = Message::Dispatch {
             id: 2,
+            attempt: 1,
+            max_attempts: 1,
             task: "x".repeat(65_536),
             payload: Vec::new(),
         };

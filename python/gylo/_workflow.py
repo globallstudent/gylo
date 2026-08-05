@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 
-from ._adapters import adapter_for
+from ._adapters import resolve
 
 if TYPE_CHECKING:
     from . import Options
@@ -83,7 +83,8 @@ class Workflow:
         """
         if not self.nodes:
             return []
-        return await adapter_for(conn).insert_workflow(
+        adapter, conn = resolve(conn)
+        return await adapter.insert_workflow(
             conn,
             [
                 (

@@ -10,7 +10,8 @@ from typing import Any
 
 import msgspec
 
-from ._adapters import UnsupportedDriverError, adapter_for
+from ._adapters import UnsupportedDriverError, WrongFlavourError, resolve
+from ._protocol import payload_limit
 from ._steps import StepContext
 from ._workflow import Signature, Workflow, chain, chord, group
 
@@ -19,6 +20,7 @@ __all__ = [
     "BoundTask",
     "CronEntry",
     "Gylo",
+    "JobContext",
     "JobOutcome",
     "NoRetryError",
     "Options",
@@ -29,11 +31,14 @@ __all__ = [
     "UnknownTaskError",
     "UnsupportedDriverError",
     "Workflow",
+    "WrongFlavourError",
     "cancel",
+    "cancel_sync",
     "chain",
     "chord",
     "group",
     "outcome",
+    "outcome_sync",
 ]
 
 DEFAULT_QUEUE = "default"
@@ -53,6 +58,24 @@ _INHERIT: Any = object()
 _encode = msgspec.msgpack.Encoder().encode
 
 
+def _async_adapter(conn: Any) -> tuple[Any, Any]:
+    adapter, conn = resolve(conn)
+    if not adapter.IS_ASYNC:
+        raise WrongFlavourError(
+            "this connection is synchronous; use the _sync variant of the call"
+        )
+    return adapter, conn
+
+
+def _sync_adapter(conn: Any) -> tuple[Any, Any]:
+    adapter, conn = resolve(conn)
+    if adapter.IS_ASYNC:
+        raise WrongFlavourError(
+            "this connection is asynchronous; await the plain variant instead"
+        )
+    return adapter, conn
+
+
 class UnknownTaskError(LookupError):
     """No task is registered under the requested name."""
 
@@ -63,6 +86,20 @@ class UnboundAppError(RuntimeError):
 
 class NoRetryError(Exception):
     """Raise to fail a job permanently regardless of its retry policy."""
+
+
+@dataclass(frozen=True, slots=True)
+class JobContext:
+    """Where a job stands, passed first to tasks registered with `context=True`."""
+
+    job_id: int
+    attempt: int
+    max_attempts: int
+
+    @property
+    def final(self) -> bool:
+        """Whether this is the last attempt the job will get."""
+        return self.attempt >= self.max_attempts
 
 
 class Task:
@@ -82,6 +119,7 @@ class Task:
         "retry_on",
         "store_result",
         "timeout",
+        "wants_context",
     )
 
     def __init__(
@@ -94,6 +132,7 @@ class Task:
         store_result: bool = False,
         durable: bool = False,
         timeout: float | None = None,
+        wants_context: bool = False,
     ) -> None:
         self._app = app
         self.name = name
@@ -103,6 +142,7 @@ class Task:
         self.store_result = store_result
         self.durable = durable
         self.timeout = timeout
+        self.wants_context = wants_context
         self.is_async = inspect.iscoroutinefunction(fn)
 
     def should_retry(self, error: BaseException) -> bool:
@@ -175,6 +215,10 @@ class Task:
         """
         return await self.options().enqueue(conn, *args, **kwargs)
 
+    def enqueue_sync(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
+        """[`enqueue`] for synchronous code, on a synchronous connection."""
+        return self.options().enqueue_sync(conn, *args, **kwargs)
+
     async def submit(self, *args: Any, **kwargs: Any) -> int:
         """Enqueue on a connection borrowed from the app's pool.
 
@@ -191,6 +235,14 @@ class Task:
         calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
     ) -> None:
         return await self.options().enqueue_many(conn, calls)
+
+    def enqueue_many_sync(
+        self,
+        conn: Any,
+        /,
+        calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
+    ) -> None:
+        return self.options().enqueue_many_sync(conn, calls)
 
     def signature(self, *args: Any, **kwargs: Any) -> Signature:
         """The task and these arguments, for placing in a workflow."""
@@ -260,10 +312,17 @@ class BoundTask:
         self.options = options
 
     def _row(self, args: Sequence[Any], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        payload = _encode((tuple(args), kwargs))
+        if len(payload) > payload_limit(self.task.name):
+            raise ValueError(
+                f"arguments for {self.task.name!r} encode to {len(payload)} "
+                f"bytes, over the {payload_limit(self.task.name)} byte limit "
+                f"a dispatch frame can carry"
+            )
         row = (
             self.options.queue,
             self.task.name,
-            _encode((tuple(args), kwargs)),
+            payload,
             self.options.priority,
             self.options.max_attempts,
             float(self.options.delay),
@@ -295,11 +354,23 @@ class BoundTask:
 
         With `unique` set, the id may belong to a job that was already queued.
         """
-        adapter = adapter_for(conn)
+        adapter, conn = _async_adapter(conn)
         row = self._row(args, kwargs)
         if self.options.unique is False:
             return await adapter.insert(conn, row)
         return await adapter.insert_unique(conn, row)
+
+    def enqueue_sync(self, conn: Any, /, *args: Any, **kwargs: Any) -> int:
+        """[`enqueue`] for synchronous code — a Django view, a Flask handler.
+
+        Takes a synchronous driver connection, or anything wrapping one, and
+        joins its transaction the same way.
+        """
+        adapter, conn = _sync_adapter(conn)
+        row = self._row(args, kwargs)
+        if self.options.unique is False:
+            return adapter.insert(conn, row)
+        return adapter.insert_unique(conn, row)
 
     async def enqueue_many(
         self,
@@ -315,9 +386,20 @@ class BoundTask:
         if not calls:
             return
         rows = [self._row(call_args, call_kwargs) for call_args, call_kwargs in calls]
-        await adapter_for(conn).insert_many(
-            conn, rows, unique=self.options.unique is not False
-        )
+        adapter, conn = _async_adapter(conn)
+        await adapter.insert_many(conn, rows, unique=self.options.unique is not False)
+
+    def enqueue_many_sync(
+        self,
+        conn: Any,
+        /,
+        calls: Sequence[tuple[Sequence[Any], dict[str, Any]]],
+    ) -> None:
+        if not calls:
+            return
+        rows = [self._row(call_args, call_kwargs) for call_args, call_kwargs in calls]
+        adapter, conn = _sync_adapter(conn)
+        adapter.insert_many(conn, rows, unique=self.options.unique is not False)
 
 
 class Gylo:
@@ -356,6 +438,7 @@ class Gylo:
         no_retry_on: tuple[type[BaseException], ...] = (),
         store_result: bool = False,
         durable: bool = False,
+        context: bool = False,
         timeout: float | None = _INHERIT,
     ) -> Any:
         """Register a function as a task, bare or called with arguments.
@@ -367,6 +450,11 @@ class Gylo:
         `store_result` keeps the return value for later retrieval. It is off by
         default because most jobs are run for their effects, and storing what
         nobody reads costs a write and a row that cannot be pruned.
+
+        `context` passes a [`JobContext`] as the task's first argument, so it
+        can see its attempt number — alert on the final attempt instead of
+        retrying into the void. Durable tasks already receive a context with
+        the same fields.
 
         `timeout` is seconds of wall clock, defaulting to the app's. `None`
         lets the task run without a deadline, which hands back responsibility
@@ -382,6 +470,11 @@ class Gylo:
                     f"durable task {task_name!r} must be async: its step "
                     f"context is awaited, and a synchronous body cannot"
                 )
+            if durable and context:
+                raise TypeError(
+                    f"durable task {task_name!r} already receives a context; "
+                    f"its step context carries the same fields"
+                )
             task = Task(
                 self,
                 task_name,
@@ -391,6 +484,7 @@ class Gylo:
                 store_result,
                 durable,
                 self.default_timeout if timeout is _INHERIT else timeout,
+                context,
             )
             self._tasks[task_name] = task
             return task
@@ -468,12 +562,7 @@ class JobOutcome:
         return self.state == "completed"
 
 
-async def outcome(conn: Any, job_id: int) -> JobOutcome | None:
-    """Look up how a job ended, or None if no such job exists.
-
-    `result` is only populated for tasks registered with `store_result=True`.
-    """
-    row = await adapter_for(conn).outcome(conn, job_id)
+def _outcome_from(row: tuple[str, bytes | None, Any] | None) -> JobOutcome | None:
     if row is None:
         return None
     state, stored, errors = row
@@ -484,6 +573,21 @@ async def outcome(conn: Any, job_id: int) -> JobOutcome | None:
     )
 
 
+async def outcome(conn: Any, job_id: int) -> JobOutcome | None:
+    """Look up how a job ended, or None if no such job exists.
+
+    `result` is only populated for tasks registered with `store_result=True`.
+    """
+    adapter, conn = _async_adapter(conn)
+    return _outcome_from(await adapter.outcome(conn, job_id))
+
+
+def outcome_sync(conn: Any, job_id: int) -> JobOutcome | None:
+    """[`outcome`] for synchronous code, on a synchronous connection."""
+    adapter, conn = _sync_adapter(conn)
+    return _outcome_from(adapter.outcome(conn, job_id))
+
+
 async def cancel(conn: Any, *job_ids: int) -> int:
     """Cancel jobs that have not started, returning how many were still waiting.
 
@@ -492,4 +596,13 @@ async def cancel(conn: Any, *job_ids: int) -> int:
     """
     if not job_ids:
         return 0
-    return await adapter_for(conn).cancel(conn, list(job_ids))
+    adapter, conn = _async_adapter(conn)
+    return await adapter.cancel(conn, list(job_ids))
+
+
+def cancel_sync(conn: Any, *job_ids: int) -> int:
+    """[`cancel`] for synchronous code, on a synchronous connection."""
+    if not job_ids:
+        return 0
+    adapter, conn = _sync_adapter(conn)
+    return adapter.cancel(conn, list(job_ids))

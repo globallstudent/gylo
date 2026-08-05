@@ -1087,3 +1087,20 @@ async fn an_endless_stderr_line_cannot_grow_the_supervisor(pool: PgPool) {
          the supervisor keeps a capped line and drops the rest"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_task_can_see_its_own_attempt(pool: PgPool) {
+    let mut job = NewJob::new("aware", Vec::new());
+    job.max_attempts = 3;
+    let id = enqueue(&pool, &job).await.unwrap();
+
+    run_until_settled_with(&pool, quick_retries()).await;
+
+    assert_eq!(
+        state_of(&pool, id).await,
+        "completed",
+        "the fixture raises unless ctx.final is true, so completing at all \
+         proves the attempt numbers travelled the wire correctly"
+    );
+    assert_eq!(attempt_of(&pool, id).await, 3);
+}

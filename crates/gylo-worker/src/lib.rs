@@ -796,6 +796,8 @@ async fn dispatch(
             }
             let message = Message::Dispatch {
                 id,
+                attempt: job.attempt,
+                max_attempts: job.max_attempts,
                 task: job.task,
                 payload: job.payload,
             };
