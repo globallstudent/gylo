@@ -59,7 +59,7 @@ jobs:
       # than only the syntax check inside it
       - run: uv venv --python 3.11
 
-      - run: uv pip install msgspec pytest pytest-asyncio asyncpg ruff
+      - run: uv pip install msgspec pytest pytest-asyncio asyncpg "psycopg[binary]" sqlalchemy greenlet ruff
 
       - run: cargo fmt --check
 
