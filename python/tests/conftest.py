@@ -28,3 +28,15 @@ async def pool():
         yield created
     finally:
         await created.close()
+
+
+PG_DSN = DSN.replace("postgres://", "postgresql://")
+
+
+@pytest.fixture
+def sync_conn():
+    psycopg = pytest.importorskip("psycopg")
+    with psycopg.connect(PG_DSN, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("TRUNCATE gylo_job CASCADE")
+        yield connection

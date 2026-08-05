@@ -63,6 +63,7 @@ dev = [
   "pytest-asyncio>=0.24",
   "ruff>=0.6",
 ]
+docs = ["mkdocs-material>=9.5"]
 # Only the benchmark harness needs these, and it compares gylo against them.
 # They must never reach an install of gylo itself.
 bench = [

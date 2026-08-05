@@ -1,0 +1,50 @@
+site_name: gylo
+site_description: A distributed task queue for Python with a Rust core
+site_url: https://globallstudent.github.io/gylo/
+repo_url: https://github.com/globallstudent/gylo
+repo_name: globallstudent/gylo
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      base_path: [docs]
+  - tables
+
+nav:
+  - Overview: index.md
+  - Getting started: quickstart.md
+  - Guide:
+      - Tasks and options: tasks.md
+      - Retries and timeouts: retries.md
+      - Scheduling and cron: scheduling.md
+      - Workflows: workflows.md
+      - Durable steps: durable-steps.md
+      - Keyed concurrency: keyed-concurrency.md
+      - Results and cancellation: results.md
+      - Synchronous code: sync.md
+  - Running it:
+      - Deployment: deployment.md
+      - Operations: operations.md

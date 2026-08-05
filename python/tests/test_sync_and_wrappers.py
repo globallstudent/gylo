@@ -30,14 +30,6 @@ app = gylo.Gylo()
 def work(n: int) -> None: ...
 
 
-@pytest.fixture
-def sync_conn():
-    with psycopg.connect(PG_DSN, autocommit=True) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("TRUNCATE gylo_job CASCADE")
-        yield conn
-
-
 def state_of(conn, job_id: int) -> str:
     with conn.cursor() as cursor:
         cursor.execute("SELECT state::text FROM gylo_job WHERE id = %s", (job_id,))

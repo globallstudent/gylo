@@ -81,6 +81,10 @@ jobs:
 
       - run: PYTHONPATH=python .venv/bin/python -m pytest python -q
 
+      # the docs must always build, or the Pages deploy breaks on the next
+      # innocent push that happens to touch them
+      - run: uv pip install mkdocs-material && .venv/bin/mkdocs build --strict
+
   # every interpreter the classifiers claim, not only the floor. The full Rust
   # suite stays on the floor job; what varies by interpreter is the Python
   # package, so that is what this matrix runs.
