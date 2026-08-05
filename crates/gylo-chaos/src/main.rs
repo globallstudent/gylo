@@ -350,6 +350,37 @@ async fn scenario_worker_kill(harness: &Harness) -> Verdict {
         .await
 }
 
+/// Two workers share the queue and one dies for good. The survivor must
+/// absorb the dead worker's leases through its own maintenance, with no
+/// restart to hide behind — a deployment losing a pod while its siblings run.
+async fn scenario_peer_reclaim(harness: &Harness) -> Verdict {
+    harness.reset().await;
+    let doomed = harness.spawn_worker();
+    let survivor = harness.spawn_worker();
+    let mut faults = 0;
+    let mut outstanding = Vec::new();
+
+    let busy = harness.wait_until_busy().await;
+    teardown(doomed).await;
+    if let Some(left) = busy {
+        faults += 1;
+        outstanding.push(left);
+    }
+
+    let settled = harness.settle().await;
+    teardown(survivor).await;
+
+    harness
+        .report(Outcome {
+            scenario: "peer reclaim",
+            faults,
+            outstanding_at_fault: outstanding,
+            settled,
+            note: None,
+        })
+        .await
+}
+
 async fn scenario_postgres_restart(harness: &Harness) -> Verdict {
     harness.reset().await;
     let worker = harness.spawn_worker();
@@ -411,6 +442,9 @@ async fn main() {
     }
     if wanted("worker") {
         verdicts.push(scenario_worker_kill(&harness).await);
+    }
+    if wanted("peer") {
+        verdicts.push(scenario_peer_reclaim(&harness).await);
     }
     if wanted("postgres") {
         verdicts.push(scenario_postgres_restart(&harness).await);
