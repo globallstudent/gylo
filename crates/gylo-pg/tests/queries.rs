@@ -985,3 +985,23 @@ async fn queues_lists_only_those_holding_live_work(pool: PgPool) {
 
     assert_eq!(gylo_pg::queues(&pool).await.unwrap(), vec!["busy"]);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_full_unkeyed_batch_does_not_starve_keyed_work(pool: PgPool) {
+    for _ in 0..130 {
+        enqueue(&pool, &NewJob::new("t", Vec::new())).await.unwrap();
+    }
+    let keyed = enqueue(&pool, &NewJob::new("k", Vec::new()).limited_to("tenant", 1))
+        .await
+        .unwrap();
+
+    let jobs = fetch(&pool, &queues("default"), 128, LEASE, worker())
+        .await
+        .unwrap();
+
+    assert!(
+        jobs.iter().any(|job| job.id == keyed),
+        "a backlog of unkeyed jobs one batch deep fills every fetch, and \
+         without a floor the keyed pass never runs at all"
+    );
+}

@@ -108,14 +108,63 @@ const ENQUEUE: &str = "
 /// admit. `SKIP LOCKED` does not help: it stops two workers taking the same
 /// row, and this is two workers taking different rows for the same key.
 ///
-/// Taken as its own statement before the fetch rather than inside it. Postgres
-/// inlines and reorders CTEs, so a lock written as one is not ordered against
-/// the count that has to follow it: expressed that way the limit was exceeded
-/// by four rather than two. Released when the transaction commits, which is
-/// after the rows are marked running and so become countable.
+/// It has to be its own statement inside a transaction. A lock written as a CTE
+/// is not ordered against the count that follows it — Postgres inlines and
+/// reorders them, and expressed that way the limit was exceeded by four rather
+/// than two. Nor can any single statement work: at READ COMMITTED the snapshot
+/// is fixed when the statement begins, so blocking on a lock part-way through
+/// still counts against the state as it was before the wait.
+///
+/// Only jobs carrying a key pay for this. Serialising every fetch measured
+/// about a quarter of the throughput of not doing so, which is far too much to
+/// spend on a feature most jobs never ask for.
 const ADMISSION_LOCK: i64 = 0x6779_6c6f_0001;
 
-const FETCH: &str = "
+/// Jobs with no key, which need no admission control and so no serialising.
+///
+/// `keyed_waiting` rides along because the caller has to know whether the
+/// slower keyed pass is worth making, and answering it here costs one index
+/// probe on a statement already being sent.
+const FETCH_UNKEYED: &str = "
+    WITH locked AS (
+        SELECT j.id
+        FROM gylo_job j
+        WHERE j.state = 'available' AND j.queue = ANY($1) AND j.scheduled_at <= now()
+          AND j.concurrency_key IS NULL
+        ORDER BY j.priority, j.scheduled_at, j.id
+        LIMIT $2
+        FOR UPDATE OF j SKIP LOCKED
+    )
+    UPDATE gylo_job j
+    SET state = 'running',
+        locked_by = $3,
+        lease_expires_at = now() + make_interval(secs => $4),
+        started_at = now(),
+        attempt = j.attempt + 1
+    FROM locked c
+    WHERE j.id = c.id
+    RETURNING j.id, j.task, j.payload, j.attempt, j.max_attempts, j.durable,
+              EXISTS (
+                  SELECT 1 FROM gylo_job k
+                  WHERE k.state = 'available' AND k.queue = ANY($1)
+                    AND k.concurrency_key IS NOT NULL AND k.scheduled_at <= now()
+              ) AS keyed_waiting
+";
+
+/// Whether any keyed job is waiting, for when the unkeyed pass returned nothing
+/// and so carried no answer with it. Idle by definition, so the extra round
+/// trip costs nothing that matters.
+const KEYED_WAITING: &str = "
+    SELECT EXISTS (
+        SELECT 1 FROM gylo_job
+        WHERE state = 'available' AND queue = ANY($1)
+          AND concurrency_key IS NOT NULL AND scheduled_at <= now()
+    )
+";
+
+/// Jobs carrying a key, admitted against a count that is only trustworthy
+/// because [`ADMISSION_LOCK`] is held for the whole transaction.
+const FETCH_KEYED: &str = "
     WITH active AS (
         SELECT concurrency_key, count(*) AS running
         FROM gylo_job
@@ -128,7 +177,8 @@ const FETCH: &str = "
         FROM gylo_job j
         LEFT JOIN active a ON a.concurrency_key = j.concurrency_key
         WHERE j.state = 'available' AND j.queue = ANY($1) AND j.scheduled_at <= now()
-          AND (j.concurrency_key IS NULL OR COALESCE(a.running, 0) < j.max_concurrency)
+          AND j.concurrency_key IS NOT NULL
+          AND COALESCE(a.running, 0) < j.max_concurrency
         ORDER BY j.priority, j.scheduled_at, j.id
         LIMIT $2
         FOR UPDATE OF j SKIP LOCKED
@@ -140,7 +190,7 @@ const FETCH: &str = "
                                       ORDER BY priority, scheduled_at, id) AS n
             FROM locked
         ) ranked
-        WHERE concurrency_key IS NULL OR already + n <= max_concurrency
+        WHERE already + n <= max_concurrency
     )
     UPDATE gylo_job j
     SET state = 'running',
@@ -529,6 +579,23 @@ pub async fn enqueue<'e, E: PgExecutor<'e>>(executor: E, job: &NewJob) -> Result
 /// Ordering is global rather than per queue, so a job's priority means the same
 /// thing wherever it was placed. Round-robin between queues would make a high
 /// priority in a quiet queue lose to a low one in a busy neighbour.
+fn job_from(row: &sqlx::postgres::PgRow) -> Result<Job, Error> {
+    Ok(Job {
+        id: row.try_get("id")?,
+        task: row.try_get("task")?,
+        payload: row.try_get("payload")?,
+        attempt: row.try_get("attempt")?,
+        max_attempts: row.try_get("max_attempts")?,
+        durable: row.try_get("durable")?,
+    })
+}
+
+/// Leases up to `limit` jobs, in two passes that cost very differently.
+///
+/// The first takes jobs with no key in one statement, which is the whole cost
+/// for a deployment that never uses admission control. The second runs only
+/// when that statement reported keyed work waiting, and pays for a transaction
+/// and a lock to make the count it admits against mean anything.
 pub async fn fetch(
     pool: &PgPool,
     queues: &[String],
@@ -536,32 +603,56 @@ pub async fn fetch(
     lease: Duration,
     worker: Uuid,
 ) -> Result<Vec<Job>, Error> {
+    let rows = sqlx::query(FETCH_UNKEYED)
+        .bind(queues)
+        .bind(limit)
+        .bind(worker)
+        .bind(lease.as_secs_f64())
+        .fetch_all(pool)
+        .await?;
+
+    let keyed_waiting: bool = match rows.first() {
+        Some(row) => row.try_get("keyed_waiting")?,
+        None => {
+            sqlx::query_scalar(KEYED_WAITING)
+                .bind(queues)
+                .fetch_one(pool)
+                .await?
+        }
+    };
+
+    let mut jobs = rows
+        .iter()
+        .map(job_from)
+        .collect::<Result<Vec<Job>, Error>>()?;
+
+    if !keyed_waiting {
+        return Ok(jobs);
+    }
+    // never zero while keyed work waits: a backlog of unkeyed jobs one batch
+    // deep would otherwise fill every fetch and starve keyed jobs entirely.
+    // The floor of one can overshoot `limit` by a single job, which is a
+    // throttle and not a safety bound.
+    let spare = (limit - jobs.len() as i64).max(1);
+
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(ADMISSION_LOCK)
         .execute(&mut *tx)
         .await?;
-    let rows = sqlx::query(FETCH)
+    let keyed = sqlx::query(FETCH_KEYED)
         .bind(queues)
-        .bind(limit)
+        .bind(spare)
         .bind(worker)
         .bind(lease.as_secs_f64())
         .fetch_all(&mut *tx)
         .await?;
     tx.commit().await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(Job {
-                id: row.try_get("id")?,
-                task: row.try_get("task")?,
-                payload: row.try_get("payload")?,
-                attempt: row.try_get("attempt")?,
-                max_attempts: row.try_get("max_attempts")?,
-                durable: row.try_get("durable")?,
-            })
-        })
-        .collect()
+    for row in &keyed {
+        jobs.push(job_from(row)?);
+    }
+    Ok(jobs)
 }
 
 /// Every failure is terminal until retry scheduling exists; this always moves
