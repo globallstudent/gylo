@@ -74,9 +74,12 @@ class Workflow:
     async def enqueue(self, conn: Any, /) -> list[int]:
         """Insert every job and edge, returning the ids in node order.
 
-        Everything lands on the caller's connection, so a workflow either
-        arrives whole inside their transaction or not at all. A partially
-        inserted graph would leave jobs waiting on parents that do not exist.
+        The adapter opens the driver's own transaction — a savepoint when the
+        caller already holds one — so the graph becomes visible whole or not
+        at all. On an autocommit connection the statements would otherwise
+        commit one by one, and a worker can complete a root before its edges
+        exist; the fan-in then finds nothing to decrement and the rest of the
+        graph parks forever.
         """
         if not self.nodes:
             return []

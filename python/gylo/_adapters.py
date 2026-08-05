@@ -163,12 +163,20 @@ class AsyncpgAdapter:
     async def insert_workflow(
         cls, conn: Any, nodes: list[tuple[Any, ...]], edges: list[tuple[int, int]]
     ) -> list[int]:
-        workflow = await conn.fetchval(_NEW_WORKFLOW)
-        ids = [await conn.fetchval(cls.INSERT_NODE, workflow, *node) for node in nodes]
-        if edges:
-            await conn.executemany(
-                cls.NEW_EDGE, [(workflow, ids[p], ids[c]) for p, c in edges]
-            )
+        # a worker can lease a root the moment its row commits, and on an
+        # autocommit connection that is before the edges exist — fan-in then
+        # finds nothing to decrement and the graph parks forever. The driver's
+        # transaction (a savepoint, when the caller already holds one) makes
+        # the graph visible whole or not at all
+        async with conn.transaction():
+            workflow = await conn.fetchval(_NEW_WORKFLOW)
+            ids = [
+                await conn.fetchval(cls.INSERT_NODE, workflow, *node) for node in nodes
+            ]
+            if edges:
+                await conn.executemany(
+                    cls.NEW_EDGE, [(workflow, ids[p], ids[c]) for p, c in edges]
+                )
         return ids
 
 
@@ -223,7 +231,7 @@ class PsycopgAdapter:
     async def insert_workflow(
         cls, conn: Any, nodes: list[tuple[Any, ...]], edges: list[tuple[int, int]]
     ) -> list[int]:
-        async with conn.cursor() as cursor:
+        async with conn.transaction(), conn.cursor() as cursor:
             await cursor.execute(_NEW_WORKFLOW)
             workflow = (await cursor.fetchone())[0]
             ids = []
