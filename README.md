@@ -28,6 +28,8 @@ gylo migrate
 gylo worker --app myapp:app --queue default
 ```
 
+Full documentation: **[globallstudent.github.io/gylo](https://globallstudent.github.io/gylo/)**
+
 ## Why
 
 **The job commits with your data or not at all.** `enqueue` takes the
